@@ -40,6 +40,7 @@
 #include <cstdio> //cstdio是将stdio.h的内容用C++头文件的形式表示出来。stdio.h是C标准函数库中的头文件，提供基本的文字的输入输出流操作
 #include <cstdlib> //cstdlib是C++里面的一个常用函数库， 等价于C中的<stdlib.h>,stdlib.h可以提供一些函数与符号常量，
 #include <cstring> //<cstring>是C标准库头文件<string.h>的C++标准库版本  包含了strcmp、strchr、strstr等操作
+#include <string>
 #include <string.h> // C版本头文件 对应基于char*的字符串处理函数
 
 #ifdef __CYGWIN__
@@ -57,15 +58,48 @@
 #endif
 
 int iPlayerId = 0;
-int currentCycle = 0;
-int lastCycle = 0;
-int kickWait = 0;
-int turnToSeeGoal = 0;
 int iSide = 0;//1:left;2:right
+int lastSeeCycle = -1;
+int goalieCatchCycle = -100;
+std::string teamName = "RobuCupTeam";
 
-//极坐标变为直角坐标
-void poly2vector(double dLen, double dAngle, double &dX, double &dY) {
-	
+double absDouble(double value) {
+	return value < 0.0 ? -value : value;
+}
+
+double normalizeAngle(double angle) {
+	while (angle > 180.0) angle -= 360.0;
+	while (angle < -180.0) angle += 360.0;
+	return angle;
+}
+
+const char * attackGoalName() {
+	return iSide == 2 ? "(goal l)" : "(goal r)";
+}
+
+const char * attackGoalShortName() {
+	return iSide == 2 ? "(g l)" : "(g r)";
+}
+
+const char * ownGoalName() {
+	return iSide == 2 ? "(goal r)" : "(goal l)";
+}
+
+const char * ownGoalShortName() {
+	return iSide == 2 ? "(g r)" : "(g l)";
+}
+
+void formationPosition(int playerId, double &x, double &y) {
+	static const double formationX[6] = { 0.0, -47.0, -30.0, -30.0, -10.0, -10.0 };
+	static const double formationY[6] = { 0.0, 0.0, -13.0, 13.0, -10.0, 10.0 };
+
+	if (playerId < 1 || playerId > 5) playerId = 5;
+	x = formationX[playerId];
+	y = formationY[playerId];
+	if (iSide == 2) {
+		x = -x;
+		y = -y;
+	}
 }
 
 class Client {
@@ -114,34 +148,34 @@ public: // 构造函数初始化列表以一个冒号开始，接着是以逗号
 	}
 
 	void run() {
-		char command[20];
-		if (iSide == 1) {
-			if (iPlayerId == 1) {
-				sprintf(command, "(init team1 (goalie))");
-			}
-			else {
-				sprintf(command, "(init team1)");
-			}
-		} else if (iSide == 2) {
-			if (iPlayerId == 1) {
-				sprintf(command, "(init team2 (goalie))");
-			}
-			else {
-				sprintf(command, "(init team2)");
-			}
-		} else {
+		char command[128];
+		double startX = 0.0;
+		double startY = 0.0;
+
+		if (iSide != 1 && iSide != 2) {
 			return;
 		}
-		if (!sendCmd(command))
-			return;
+
 		if (iPlayerId == 1) {
-			sprintf(command, "(move -45 0)");
+			sprintf(command, "(init %.40s (goalie))", teamName.c_str());
 		}
 		else {
-			sprintf(command, "(move -3 0)");
+			sprintf(command, "(init %.40s)", teamName.c_str());
 		}
 		if (!sendCmd(command))
 			return;
+
+		formationPosition(iPlayerId, startX, startY);
+		sprintf(command, "(move %.1f %.1f)", startX, startY);
+		if (!sendCmd(command))
+			return;
+
+		sprintf(command, iPlayerId == 1
+				? "(change_view normal high)"
+				: "(change_view wide high)");
+		if (!sendCmd(command))
+			return;
+
 		messageLoop(); // 函数  消息循环 踢球中。。。
 	}
 
@@ -215,6 +249,7 @@ private:
 		}
 		return M_comp_level = level;
 #endif
+		(void)level;
 		return M_comp_level = -1;
 	}
 
@@ -238,157 +273,235 @@ private:
 		}
 	}
 
+	int readObjectInfo(const char *msg, const char *name,
+			double &distance, double &direction) {
+		const char *object = strstr(msg, name);
+		if (object == 0) return 0;
+		return std::sscanf(object + strlen(name), " %lf %lf",
+				&distance, &direction) == 2;
+	}
+
+	int readBallInfo(const char *msg, double &distance, double &direction) {
+		return readObjectInfo(msg, "(ball)", distance, direction)
+				|| readObjectInfo(msg, "(b)", distance, direction);
+	}
+
+	int readAttackGoalInfo(const char *msg,
+			double &distance, double &direction) {
+		return readObjectInfo(msg, attackGoalName(), distance, direction)
+				|| readObjectInfo(msg, attackGoalShortName(), distance, direction);
+	}
+
+	int readOwnGoalInfo(const char *msg,
+			double &distance, double &direction) {
+		return readObjectInfo(msg, ownGoalName(), distance, direction)
+				|| readObjectInfo(msg, ownGoalShortName(), distance, direction);
+	}
+
+	int makeDepthCommand(const char *msg, double minimumDistance,
+			double maximumDistance, char *command) {
+		double goalDistance = 0.0;
+		double goalDirection = 0.0;
+		if (!readOwnGoalInfo(msg, goalDistance, goalDirection)) return 0;
+
+		double moveDirection = 0.0;
+		if (goalDistance > maximumDistance) {
+			moveDirection = goalDirection;
+		}
+		else if (goalDistance < minimumDistance) {
+			moveDirection = normalizeAngle(goalDirection + 180.0);
+		}
+		else {
+			return 0;
+		}
+
+		if (absDouble(moveDirection) > 12.0) {
+			sprintf(command, "(turn %.1f)", moveDirection);
+		}
+		else {
+			sprintf(command, "(dash 55)");
+		}
+		return 1;
+	}
+
+	void handleGoalkeeper(const char *msg, int cycle) {
+		double ballDistance = 0.0;
+		double ballDirection = 0.0;
+		double goalDistance = 0.0;
+		double goalDirection = 0.0;
+		const int hasBall = readBallInfo(msg, ballDistance, ballDirection);
+		const int hasAttackGoal = readAttackGoalInfo(msg,
+				goalDistance, goalDirection);
+		char command[128];
+
+		// A catch attempt is followed by a clearance on the next observation.
+		if (goalieCatchCycle >= 0 && cycle - goalieCatchCycle <= 2) {
+			if (hasBall && ballDistance < 1.5) {
+				sprintf(command, "(kick 100 %.1f)",
+						hasAttackGoal ? goalDirection : 0.0);
+				goalieCatchCycle = -100;
+				sendCmd(command);
+				return;
+			}
+		}
+		else {
+			goalieCatchCycle = -100;
+		}
+
+		if (!hasBall) {
+			if (makeDepthCommand(msg, 4.0, 9.0, command)) {
+				sendCmd(command);
+			}
+			else {
+				sprintf(command, "(turn 45)");
+				sendCmd(command);
+			}
+			return;
+		}
+
+		if (ballDistance <= 1.15) {
+			sprintf(command, "(catch %.1f)", ballDirection);
+			goalieCatchCycle = cycle;
+			sendCmd(command);
+			return;
+		}
+
+		if (ballDistance <= 11.0) {
+			if (absDouble(ballDirection) > 10.0) {
+				sprintf(command, "(turn %.1f)", ballDirection);
+			}
+			else if (ballDistance > 6.0) {
+				sprintf(command, "(dash 70)");
+			}
+			else if (ballDistance > 3.0) {
+				sprintf(command, "(dash 45)");
+			}
+			else {
+				sprintf(command, "(dash 25)");
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (makeDepthCommand(msg, 4.0, 9.0, command)) {
+			sendCmd(command);
+		}
+		else if (absDouble(ballDirection) > 5.0) {
+			sprintf(command, "(turn %.1f)", ballDirection);
+			sendCmd(command);
+		}
+		else {
+			sprintf(command, "(turn 0)");
+			sendCmd(command);
+		}
+	}
+
+	void handleFieldPlayer(const char *msg) {
+		double ballDistance = 0.0;
+		double ballDirection = 0.0;
+		double goalDistance = 0.0;
+		double goalDirection = 0.0;
+		char command[128];
+
+		if (!readBallInfo(msg, ballDistance, ballDirection)) {
+			sprintf(command, "(turn %d)", iPlayerId % 2 == 0 ? 45 : -45);
+			sendCmd(command);
+			return;
+		}
+
+		double chaseLimit = 0.0;
+		double minimumHomeDistance = 0.0;
+		double maximumHomeDistance = 100.0;
+		if (iPlayerId == 2) {
+			chaseLimit = 22.0;
+			minimumHomeDistance = 17.0;
+			maximumHomeDistance = 30.0;
+		}
+		else if (iPlayerId == 3) {
+			chaseLimit = 16.0;
+			minimumHomeDistance = 19.0;
+			maximumHomeDistance = 32.0;
+		}
+		else if (iPlayerId == 4) {
+			chaseLimit = 1000.0; // Primary attacker always applies pressure.
+		}
+		else {
+			chaseLimit = 20.0;
+			minimumHomeDistance = 32.0;
+			maximumHomeDistance = 45.0;
+		}
+
+		if (ballDistance > chaseLimit) {
+			if (makeDepthCommand(msg, minimumHomeDistance,
+					maximumHomeDistance, command)) {
+				sendCmd(command);
+			}
+			else if (absDouble(ballDirection) > 6.0) {
+				sprintf(command, "(turn %.1f)", ballDirection);
+				sendCmd(command);
+			}
+			else {
+				sprintf(command, "(turn 0)");
+				sendCmd(command);
+			}
+			return;
+		}
+
+		if (ballDistance > 0.75) {
+			if (absDouble(ballDirection) > 12.0) {
+				sprintf(command, "(turn %.1f)", ballDirection);
+			}
+			else {
+				const int dashPower = iPlayerId <= 3 ? 75 : 90;
+				sprintf(command, "(dash %d)", dashPower);
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (readAttackGoalInfo(msg, goalDistance, goalDirection)) {
+			const int kickPower = goalDistance < 25.0 ? 100 : 70;
+			sprintf(command, "(kick %d %.1f)", kickPower, goalDirection);
+		}
+		else if (iPlayerId == 2 || iPlayerId == 3) {
+			const int clearDirection = iPlayerId == 2 ? -25 : 25;
+			sprintf(command, "(kick 75 %d)", clearDirection);
+		}
+		else {
+			const int advanceDirection = iPlayerId == 4 ? -12 : 12;
+			sprintf(command, "(kick 35 %d)", advanceDirection);
+		}
+		sendCmd(command);
+	}
+
 	void parseMsg(char * msg, const size_t len) {
-		std::cout << std::string( msg, len - 1 ) << std::endl;
-		if (!std::strncmp(msg, "(ok compression", 15)) { //strncmp 比较字符串 相同返回0
+		(void)len;
+		if (!std::strncmp(msg, "(ok compression", 15)) {
 			int level;
-			if (std::sscanf(msg, " ( ok compression %d )", &level) == 1) { // level会等于compression 后面的数字
+			if (std::sscanf(msg, "(ok compression %d", &level) == 1) {
 				setCompression(level);
 			}
-		} else if (!std::strncmp(msg, "(sense_body", 11) //串比较，比较msg和sense_body前11个字符  请求server 发送身体感知信息
-				|| !std::strncmp(msg, "(see_global", 11) || !std::strncmp(msg,
-				"(init", 5)) { // 如果教练打开了视觉消息开关（eye on），则在每个周期的开始，它将定期收到全局视觉消息
+			return;
+		}
+
+		if (!std::strncmp(msg, "(sense_body", 11)
+				|| !std::strncmp(msg, "(see_global", 11)
+				|| !std::strncmp(msg, "(init", 5)) {
 			M_clean_cycle = true;
 		}
 
+		if (std::strncmp(msg, "(see ", 5)) return;
+
+		int cycle = -1;
+		if (std::sscanf(msg, "(see %d", &cycle) != 1) return;
+		if (cycle == lastSeeCycle) return;
+		lastSeeCycle = cycle;
 
 		if (iPlayerId == 1) {
-			//守门员
-			if (std::strncmp(msg, "(see ", 5)) {
-				return;
-			}
-			double ball_dist = 0;
-			double ball_dir = 0;
-			char command[20];
-			char *pball;
-			pball = strstr(msg, "(ball)"); // strstr在串中查找指定字符串的第一次出现
-			if (pball == 0) {
-				sprintf(command, "(turn 60)"); //把结果输出到指定的字符串
-				if (!sendCmd(command))
-					return;
-				return;
-			}
-			//看见球
-			if (std::sscanf(pball, "(ball) %lf %lf", &ball_dist, &ball_dir)
-					!= 2) {
-				printf("get ball error\n");
-				return;
-			}
-
-			//			printf("%s\t%lf\t%lf\t%lf\t%lf\n", msg, goal_dist, goal_dir,
-			//					ball_dist, ball_dir);
-			//扑球
-			if (ball_dist < 3) {
-				sprintf(command, "(catch %lf)", ball_dir);
-				if (!sendCmd(command))
-					return;
-				return;
-			}
-			if (ball_dir > 10 || ball_dir < -10) {
-				sprintf(command, "(turn %lf)", ball_dir);
-				if (!sendCmd(command))
-					return;
-				return;
-			}
-		} else {
-			if (!std::strncmp(msg, "(see ", 5)) {
-				//see
-				//get cycle
-				if (std::sscanf(msg, "(see  %d )", &currentCycle) == 1) {
-					if (currentCycle == 0) {
-						//before_kick_off
-						return;
-					}
-					if (currentCycle == lastCycle) {
-						//before_kick_off
-						return;
-					}
-					if (currentCycle > lastCycle) {
-						kickWait++;
-						if (kickWait < 3)
-							return;
-						double goal_dist = 0;
-						double goal_dir = 0;
-						double ball_dist = 0;
-						double ball_dir = 0;
-						char command[20];
-						int len;
-						int canSeeGoal;
-						//kick_off
-						lastCycle = currentCycle;
-						//search goal
-						char *pgoal;
-						// 左队进攻右球门，右队进攻左球门。
-						// move 命令的坐标由服务端按 side 自动镜像，
-						// 但视觉消息中的球门名称不会自动替换。
-						const char *opponentGoal = (iSide == 1)
-								? "(goal r)"
-								: "(goal l)";
-						pgoal = strstr(msg, opponentGoal);
-						if (pgoal != 0) {
-							if (std::sscanf(pgoal, "(goal %*c) %lf %lf",
-									&goal_dist, &goal_dir) != 2) {
-								printf("get goal error\n");
-							}
-							canSeeGoal = 1;
-						} else {
-							canSeeGoal = 0;
-						}
-						char *pball;
-						if (!turnToSeeGoal) {
-							pball = strstr(msg, "(ball)");
-							if (pball != 0) {
-								if (std::sscanf(pball, "(ball) %lf %lf",
-										&ball_dist, &ball_dir) != 2) {
-									printf("get ball error\n");
-								}
-							} else {
-								sprintf(command, "(turn 50)");
-								if (!sendCmd(command))
-									return;
-								printf("turn to see ball\n");
-								return;
-							}
-							printf("%s\t%lf\t%lf\t%lf\t%lf\n", msg, goal_dist,
-									goal_dir, ball_dist, ball_dir);
-							//ball turn
-							if (ball_dir > 2 || ball_dir < -2) {
-								sprintf(command, "(turn %lf)", ball_dir);
-								if (!sendCmd(command))
-									return;
-								return;
-							}
-							//ball dash
-							if (ball_dist > 0.5) {
-								sprintf(command, "(dash 100)");
-								if (!sendCmd(command))
-									return;
-								return;
-							}
-						}
-						//kick
-						turnToSeeGoal = 1;
-						if (!canSeeGoal) {
-							sprintf(command, "(turn 50)");
-							len = strlen(command) + 1;
-							printf("command:%s\n", command);
-							M_transport->write(command, len);
-							M_transport->flush();
-							if (!M_transport->good()) {
-								printf("error send socket\n");
-								return;
-							}
-							printf("turn to see goal\n");
-							return;
-						}
-						sprintf(command, "(kick 100 %lf)", goal_dir);
-						if (!sendCmd(command))
-							return;
-						kickWait = 0;
-						turnToSeeGoal = 0;
-					}
-				}
-			}
+			handleGoalkeeper(msg, cycle);
+		}
+		else if (iPlayerId >= 2 && iPlayerId <= 5) {
+			handleFieldPlayer(msg);
 		}
 	}
 
@@ -506,6 +619,12 @@ int main(int argc, char **argv) {
 		if (std::strcmp(argv[i], "-id") == 0) {
 			if (i + 1 < argc) {
 				iPlayerId = std::atoi(argv[i + 1]);
+				++i;
+			}
+		}
+		if (std::strcmp(argv[i], "-team") == 0) {
+			if (i + 1 < argc) {
+				teamName = argv[i + 1];
 				++i;
 			}
 		}
