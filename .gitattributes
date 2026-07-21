@@ -1,0 +1,21 @@
+# Keep Linux build scripts and source files consistent across Windows and WSL.
+* text=auto
+
+.gitattributes text eol=lf
+.gitignore text eol=lf
+*.sh text eol=lf
+*.cpp text eol=lf
+*.h text eol=lf
+*.hpp text eol=lf
+*.c text eol=lf
+*.am text eol=lf
+*.in text eol=lf
+*.m4 text eol=lf
+
+configure text eol=lf
+config.guess text eol=lf
+config.sub text eol=lf
+depcomp text eol=lf
+install-sh text eol=lf
+missing text eol=lf
+ylwrap text eol=lf

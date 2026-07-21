@@ -1,0 +1,12 @@
+# This repository only collaborates on the E4 submission files.
+# Every member keeps the remaining team1 build environment locally.
+/*
+
+!/.gitignore
+!/.gitattributes
+!/开发规范.md
+!/run.sh
+!/src/
+
+/src/*
+!/src/client.cpp
