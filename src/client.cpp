@@ -44,7 +44,7 @@
 #include <string.h> // C版本头文件 对应基于char*的字符串处理函数
 
 #ifdef __CYGWIN__
-// cygwin is not win32
+// cygwin 不算 win32
 #elif defined(_WIN32) || defined(__WIN32__) || defined (WIN32)
 #  define RCSS_WIN
 #  include <winsock2.h> // 连接系统和用户使用的软件之间用于交流的一个接口，这个功能就是修复软件与系统正确的通讯的作用
@@ -61,7 +61,10 @@ int iPlayerId = 0;
 int iSide = 0;//1:left;2:right
 int lastSeeCycle = -1;
 int goalieCatchCycle = -100;
-std::string teamName = "RobuCupTeam";
+// 默认为空：run() 按 iSide 选用 team1/team2，保证左右为两支不同队伍。
+// 若传入 -team，则使用自定义队名覆盖上述默认。
+std::string teamName;
+bool teamNameFromArg = false;
 
 double absDouble(double value) {
 	return value < 0.0 ? -value : value;
@@ -90,16 +93,14 @@ const char * ownGoalShortName() {
 }
 
 void formationPosition(int playerId, double &x, double &y) {
+	// 开球落位一律使用左队坐标系。
+	// 右队的 (move) 由服务器自动镜像，客户端不可再取反。
 	static const double formationX[6] = { 0.0, -47.0, -30.0, -30.0, -10.0, -10.0 };
 	static const double formationY[6] = { 0.0, 0.0, -13.0, 13.0, -10.0, 10.0 };
 
 	if (playerId < 1 || playerId > 5) playerId = 5;
 	x = formationX[playerId];
 	y = formationY[playerId];
-	if (iSide == 2) {
-		x = -x;
-		y = -y;
-	}
 }
 
 class Client {
@@ -154,6 +155,10 @@ public: // 构造函数初始化列表以一个冒号开始，接着是以逗号
 
 		if (iSide != 1 && iSide != 2) {
 			return;
+		}
+
+		if (!teamNameFromArg) {
+			teamName = (iSide == 1) ? "team1" : "team2";
 		}
 
 		if (iPlayerId == 1) {
@@ -334,7 +339,7 @@ private:
 				goalDistance, goalDirection);
 		char command[128];
 
-		// A catch attempt is followed by a clearance on the next observation.
+		// 扑球成功后，下一两次观测内执行解围踢球。
 		if (goalieCatchCycle >= 0 && cycle - goalieCatchCycle <= 2) {
 			if (hasBall && ballDistance < 1.5) {
 				sprintf(command, "(kick 100 %.1f)",
@@ -423,7 +428,7 @@ private:
 			maximumHomeDistance = 32.0;
 		}
 		else if (iPlayerId == 4) {
-			chaseLimit = 1000.0; // Primary attacker always applies pressure.
+			chaseLimit = 1000.0; // 主攻球员始终积极逼抢。
 		}
 		else {
 			chaseLimit = 20.0;
@@ -530,7 +535,7 @@ private:
 				perror("Error selecting input");
 				break;
 			} else if (ret != 0) {
-				// read from stdin
+				// 从标准输入读取
 				if (FD_ISSET(in, &read_fds)) {
 					if (std::fgets(buf, sizeof(buf), stdin) != NULL) {
 						size_t len = std::strlen(buf);
@@ -554,7 +559,7 @@ private:
 					}
 				}
 
-				// read from socket
+				// 从套接字读取
 				if (FD_ISSET(M_socket.getFD(), &read_fds)) {
 					rcss::net::Addr from;
 					int len = M_socket.recv(buf, sizeof(buf) - 1, from);
@@ -625,6 +630,7 @@ int main(int argc, char **argv) {
 		if (std::strcmp(argv[i], "-team") == 0) {
 			if (i + 1 < argc) {
 				teamName = argv[i + 1];
+				teamNameFromArg = true;
 				++i;
 			}
 		}
