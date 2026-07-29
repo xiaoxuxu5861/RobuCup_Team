@@ -42,6 +42,7 @@
 #include <cstring> //<cstring>是C标准库头文件<string.h>的C++标准库版本  包含了strcmp、strchr、strstr等操作
 #include <string>
 #include <string.h> // C版本头文件 对应基于char*的字符串处理函数
+#include <cmath>
 
 #ifdef __CYGWIN__
 // cygwin 不算 win32
@@ -65,6 +66,218 @@ int goalieCatchCycle = -100;
 // 若传入 -team，则使用自定义队名覆盖上述默认。
 std::string teamName;
 bool teamNameFromArg = false;
+
+struct SeenPlayer {
+	int unum;
+	double distance;
+	double direction;
+};
+
+struct VisualState {
+	int cycle;
+	bool hasBall;
+	double ballDistance;
+	double ballDirection;
+	bool hasOwnGoal;
+	bool hasAttackGoal;
+	double ownGoalDistance;
+	double ownGoalDirection;
+	double attackGoalDistance;
+	double attackGoalDirection;
+	SeenPlayer teammates[4];
+	int teammateCount;
+	SeenPlayer opponents[5];
+	int opponentCount;
+};
+
+enum PlayMode {
+	PM_UNKNOWN = 0,
+	PM_BEFORE_KICK_OFF,
+	PM_PLAY_ON,
+	PM_GOAL_L,
+	PM_GOAL_R,
+	PM_KICK_OFF_L,
+	PM_KICK_OFF_R,
+	PM_OTHER
+};
+
+struct MatchState {
+	PlayMode playMode;
+	int sideFromServer; // 0 unknown, 1 left, 2 right
+	int unumFromServer;
+};
+
+MatchState gMatchState = { PM_UNKNOWN, 0, 0 };
+int lastHeardChaseUnum = 0;
+int lastHeardChaseCycle = -100;
+int lastChaseSayCycle = -100;
+const char *gLastChaseReason = "none";
+
+double estimateDistance(double selfToA, double selfToB,
+		double dirA, double dirB) {
+	const double delta = (dirA - dirB) * 3.141592653589793 / 180.0;
+	const double d2 = selfToA * selfToA + selfToB * selfToB
+			- 2.0 * selfToA * selfToB * std::cos(delta);
+	return d2 > 0.0 ? std::sqrt(d2) : 0.0;
+}
+
+int chaseRoleRank(int playerId) {
+	if (playerId == 4) return 4;
+	if (playerId == 5) return 3;
+	if (playerId == 2) return 2;
+	if (playerId == 3) return 1;
+	return 0;
+}
+
+bool parseInitMessage(const char *msg) {
+	char sideChar = 0;
+	int unum = 0;
+	if (std::sscanf(msg, "(init %c %d", &sideChar, &unum) < 2) {
+		return false;
+	}
+	if (sideChar == 'l' || sideChar == 'L') {
+		gMatchState.sideFromServer = 1;
+	}
+	else if (sideChar == 'r' || sideChar == 'R') {
+		gMatchState.sideFromServer = 2;
+	}
+	else {
+		return false;
+	}
+	gMatchState.unumFromServer = unum;
+	if (gMatchState.sideFromServer == 1 || gMatchState.sideFromServer == 2) {
+		iSide = gMatchState.sideFromServer;
+	}
+	if (unum >= 1 && unum <= 5) {
+		iPlayerId = unum;
+	}
+	printf("init_parse: sideFromServer=%d unumFromServer=%d iSide=%d iPlayerId=%d\n",
+			gMatchState.sideFromServer, gMatchState.unumFromServer,
+			iSide, iPlayerId);
+	return true;
+}
+
+bool parseRefereeMessage(const char *msg, MatchState &state) {
+	// (hear <time> referee <play_mode>)
+	const char *referee = std::strstr(msg, "referee ");
+	if (referee == 0) {
+		return false;
+	}
+	referee += 8;
+	if (std::strncmp(referee, "before_kick_off", 15) == 0) {
+		state.playMode = PM_BEFORE_KICK_OFF;
+	}
+	else if (std::strncmp(referee, "play_on", 7) == 0) {
+		state.playMode = PM_PLAY_ON;
+	}
+	else if (std::strncmp(referee, "goal_l", 6) == 0) {
+		state.playMode = PM_GOAL_L;
+	}
+	else if (std::strncmp(referee, "goal_r", 6) == 0) {
+		state.playMode = PM_GOAL_R;
+	}
+	else if (std::strncmp(referee, "kick_off_l", 10) == 0) {
+		state.playMode = PM_KICK_OFF_L;
+	}
+	else if (std::strncmp(referee, "kick_off_r", 10) == 0) {
+		state.playMode = PM_KICK_OFF_R;
+	}
+	else {
+		state.playMode = PM_OTHER;
+	}
+	printf("referee_parse: playMode=%d\n", static_cast<int>(state.playMode));
+	return true;
+}
+
+void handleHearMessage(const char *msg, int cycle) {
+	if (std::strstr(msg, "referee ") != 0) {
+		parseRefereeMessage(msg, gMatchState);
+		return;
+	}
+	if (std::strstr(msg, "self") != 0) {
+		return;
+	}
+
+	const char *quoted = std::strchr(msg, '"');
+	if (quoted == 0 || quoted[1] != 'c') {
+		return;
+	}
+	const int claimed = quoted[2] - '0';
+	if (claimed < 2 || claimed > 5 || claimed == iPlayerId) {
+		return;
+	}
+	lastHeardChaseUnum = claimed;
+	lastHeardChaseCycle = cycle;
+}
+
+bool shouldChaseBall(const VisualState &state, int playerId) {
+	gLastChaseReason = "none";
+	if (!state.hasBall) {
+		gLastChaseReason = "no_ball";
+		return false;
+	}
+
+	bool sawComparableTeammate = false;
+	for (int i = 0; i < state.teammateCount; ++i) {
+		const SeenPlayer &tm = state.teammates[i];
+		if (tm.unum < 2 || tm.unum > 5 || tm.unum == playerId) {
+			continue;
+		}
+		sawComparableTeammate = true;
+		const double est = estimateDistance(tm.distance, state.ballDistance,
+				tm.direction, state.ballDirection);
+		if (est + 1.5 < state.ballDistance) {
+			gLastChaseReason = "closer";
+			return false;
+		}
+		if (absDouble(est - state.ballDistance) <= 1.5 && tm.unum < playerId) {
+			gLastChaseReason = "closer";
+			return false;
+		}
+	}
+
+	// 门前危急：允许最近后卫接管，即使角色优先级低于 4/5。
+	if (state.hasOwnGoal && state.ballDistance < 8.0
+			&& state.ownGoalDistance < 25.0
+			&& (playerId == 2 || playerId == 3)) {
+		bool closerThanOtherDefender = true;
+		for (int i = 0; i < state.teammateCount; ++i) {
+			const SeenPlayer &tm = state.teammates[i];
+			if (tm.unum != 2 && tm.unum != 3) continue;
+			if (tm.unum == playerId) continue;
+			const double est = estimateDistance(tm.distance, state.ballDistance,
+					tm.direction, state.ballDirection);
+			if (est + 0.5 < state.ballDistance) {
+				closerThanOtherDefender = false;
+				break;
+			}
+		}
+		if (closerThanOtherDefender) {
+			gLastChaseReason = "emergency";
+			return true;
+		}
+	}
+
+	if (lastHeardChaseUnum >= 2 && lastHeardChaseUnum <= 5
+			&& lastHeardChaseUnum != playerId
+			&& state.cycle - lastHeardChaseCycle <= 10) {
+		gLastChaseReason = "hear";
+		return false;
+	}
+
+	const bool hearFresh = lastHeardChaseUnum >= 2 && lastHeardChaseUnum <= 5
+			&& state.cycle - lastHeardChaseCycle <= 10;
+	if (!sawComparableTeammate && !hearFresh) {
+		// 信息不足：仅 4 号主动追，避免四人同冲。
+		if (chaseRoleRank(playerId) < 4) {
+			gLastChaseReason = "priority";
+			return false;
+		}
+	}
+
+	gLastChaseReason = "self";
+	return true;
+}
 
 double absDouble(double value) {
 	return value < 0.0 ? -value : value;
@@ -303,6 +516,58 @@ private:
 				|| readObjectInfo(msg, ownGoalShortName(), distance, direction);
 	}
 
+	void collectPlayersFromSee(const char *msg, const char *tag,
+			VisualState &state) {
+		const size_t tagLen = std::strlen(tag);
+		const char *cursor = msg;
+		while ((cursor = std::strstr(cursor, tag)) != 0) {
+			char seenTeam[64];
+			int unum = 0;
+			double distance = 0.0;
+			double direction = 0.0;
+			seenTeam[0] = '\0';
+			const int n = std::sscanf(cursor + tagLen, "%63s %d) %lf %lf",
+					seenTeam, &unum, &distance, &direction);
+			cursor += tagLen;
+			if (n < 4 || unum < 1) {
+				continue;
+			}
+
+			SeenPlayer seen;
+			seen.unum = unum;
+			seen.distance = distance;
+			seen.direction = direction;
+
+			if (!teamName.empty() && std::strcmp(seenTeam, teamName.c_str()) == 0) {
+				if (unum >= 2 && unum <= 5 && unum != iPlayerId
+						&& state.teammateCount < 4) {
+					state.teammates[state.teammateCount++] = seen;
+				}
+			}
+			else if (state.opponentCount < 5) {
+				state.opponents[state.opponentCount++] = seen;
+			}
+		}
+	}
+
+	bool parseVisualState(const char *msg, VisualState &state) {
+		std::memset(&state, 0, sizeof(state));
+		if (std::sscanf(msg, "(see %d", &state.cycle) != 1) {
+			return false;
+		}
+
+		state.hasBall = readBallInfo(msg, state.ballDistance,
+				state.ballDirection) != 0;
+		state.hasOwnGoal = readOwnGoalInfo(msg, state.ownGoalDistance,
+				state.ownGoalDirection) != 0;
+		state.hasAttackGoal = readAttackGoalInfo(msg, state.attackGoalDistance,
+				state.attackGoalDirection) != 0;
+
+		collectPlayersFromSee(msg, "(player ", state);
+		collectPlayersFromSee(msg, "(p ", state);
+		return true;
+	}
+
 	int makeDepthCommand(const char *msg, double minimumDistance,
 			double maximumDistance, char *command) {
 		double goalDistance = 0.0;
@@ -401,18 +666,20 @@ private:
 		}
 	}
 
-	void handleFieldPlayer(const char *msg) {
-		double ballDistance = 0.0;
-		double ballDirection = 0.0;
-		double goalDistance = 0.0;
-		double goalDirection = 0.0;
-		char command[128];
+	void handleFieldPlayer(const char *msg, const VisualState &visual,
+			int cycle) {
+		char command[160];
 
-		if (!readBallInfo(msg, ballDistance, ballDirection)) {
+		if (!visual.hasBall) {
 			sprintf(command, "(turn %d)", iPlayerId % 2 == 0 ? 45 : -45);
 			sendCmd(command);
 			return;
 		}
+
+		const double ballDistance = visual.ballDistance;
+		const double ballDirection = visual.ballDirection;
+		double goalDistance = visual.attackGoalDistance;
+		double goalDirection = visual.attackGoalDirection;
 
 		double chaseLimit = 0.0;
 		double minimumHomeDistance = 0.0;
@@ -428,7 +695,7 @@ private:
 			maximumHomeDistance = 32.0;
 		}
 		else if (iPlayerId == 4) {
-			chaseLimit = 1000.0; // 主攻球员始终积极逼抢。
+			chaseLimit = 38.0;
 		}
 		else {
 			chaseLimit = 20.0;
@@ -436,7 +703,13 @@ private:
 			maximumHomeDistance = 45.0;
 		}
 
-		if (ballDistance > chaseLimit) {
+		const int mayChase = shouldChaseBall(visual, iPlayerId);
+		printf("chase_debug: cycle=%d id=%d side=%d srvSide=%d playMode=%d ball=%.1f tm=%d chase=%d reason=%s\n",
+				cycle, iPlayerId, iSide, gMatchState.sideFromServer,
+				static_cast<int>(gMatchState.playMode), ballDistance,
+				visual.teammateCount, mayChase, gLastChaseReason);
+
+		if (!mayChase || ballDistance > chaseLimit) {
 			if (makeDepthCommand(msg, minimumHomeDistance,
 					maximumHomeDistance, command)) {
 				sendCmd(command);
@@ -458,13 +731,19 @@ private:
 			}
 			else {
 				const int dashPower = iPlayerId <= 3 ? 75 : 90;
-				sprintf(command, "(dash %d)", dashPower);
+				if (cycle - lastChaseSayCycle >= 4) {
+					sprintf(command, "(dash %d)(say c%d)", dashPower, iPlayerId);
+					lastChaseSayCycle = cycle;
+				}
+				else {
+					sprintf(command, "(dash %d)", dashPower);
+				}
 			}
 			sendCmd(command);
 			return;
 		}
 
-		if (readAttackGoalInfo(msg, goalDistance, goalDirection)) {
+		if (visual.hasAttackGoal) {
 			const int kickPower = goalDistance < 25.0 ? 100 : 70;
 			sprintf(command, "(kick %d %.1f)", kickPower, goalDirection);
 		}
@@ -480,7 +759,10 @@ private:
 	}
 
 	void parseMsg(char * msg, const size_t len) {
-		(void)len;
+		if (len > 0) {
+			msg[len] = '\0';
+		}
+
 		if (!std::strncmp(msg, "(ok compression", 15)) {
 			int level;
 			if (std::sscanf(msg, "(ok compression %d", &level) == 1) {
@@ -489,9 +771,26 @@ private:
 			return;
 		}
 
+		if (!std::strncmp(msg, "(init", 5)) {
+			parseInitMessage(msg);
+			M_clean_cycle = true;
+			return;
+		}
+
+		if (!std::strncmp(msg, "(hear", 5)) {
+			int hearCycle = 0;
+			if (std::sscanf(msg, "(hear %d", &hearCycle) == 1) {
+				handleHearMessage(msg, hearCycle);
+			}
+			else {
+				handleHearMessage(msg, lastSeeCycle);
+			}
+			M_clean_cycle = true;
+			return;
+		}
+
 		if (!std::strncmp(msg, "(sense_body", 11)
-				|| !std::strncmp(msg, "(see_global", 11)
-				|| !std::strncmp(msg, "(init", 5)) {
+				|| !std::strncmp(msg, "(see_global", 11)) {
 			M_clean_cycle = true;
 		}
 
@@ -502,11 +801,16 @@ private:
 		if (cycle == lastSeeCycle) return;
 		lastSeeCycle = cycle;
 
+		VisualState visual;
+		if (!parseVisualState(msg, visual)) {
+			return;
+		}
+
 		if (iPlayerId == 1) {
 			handleGoalkeeper(msg, cycle);
 		}
 		else if (iPlayerId >= 2 && iPlayerId <= 5) {
-			handleFieldPlayer(msg);
+			handleFieldPlayer(msg, visual, cycle);
 		}
 	}
 
@@ -640,6 +944,15 @@ int main(int argc, char **argv) {
 		if (std::strcmp(argv[i], "-sider") == 0) {
 			iSide = 2;
 		}
+	}
+
+	if (iPlayerId < 1 || iPlayerId > 5) {
+		std::cerr << "error: -id must be 1..5, got " << iPlayerId << std::endl;
+		return EXIT_FAILURE;
+	}
+	if (iSide != 1 && iSide != 2) {
+		std::cerr << "error: specify -sidel or -sider" << std::endl;
+		return EXIT_FAILURE;
 	}
 
 	client = new Client(server, port);
