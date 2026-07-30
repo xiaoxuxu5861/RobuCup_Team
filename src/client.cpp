@@ -67,6 +67,16 @@ int goalieCatchCycle = -100;
 std::string teamName;
 bool teamNameFromArg = false;
 
+double absDouble(double value) {
+	return value < 0.0 ? -value : value;
+}
+
+double normalizeAngle(double angle) {
+	while (angle > 180.0) angle -= 360.0;
+	while (angle < -180.0) angle += 360.0;
+	return angle;
+}
+
 struct SeenPlayer {
 	int unum;
 	double distance;
@@ -277,16 +287,6 @@ bool shouldChaseBall(const VisualState &state, int playerId) {
 
 	gLastChaseReason = "self";
 	return true;
-}
-
-double absDouble(double value) {
-	return value < 0.0 ? -value : value;
-}
-
-double normalizeAngle(double angle) {
-	while (angle > 180.0) angle -= 360.0;
-	while (angle < -180.0) angle += 360.0;
-	return angle;
 }
 
 const char * attackGoalName() {
@@ -747,13 +747,16 @@ private:
 			const int kickPower = goalDistance < 25.0 ? 100 : 70;
 			sprintf(command, "(kick %d %.1f)", kickPower, goalDirection);
 		}
-		else if (iPlayerId == 2 || iPlayerId == 3) {
-			const int clearDirection = iPlayerId == 2 ? -25 : 25;
-			sprintf(command, "(kick 75 %d)", clearDirection);
+		else if (visual.hasOwnGoal) {
+			// 看不见对方球门：朝远离本方球门方向解围，避免相对身体小偏角造成乌龙。
+			const double clearDirection = normalizeAngle(
+					visual.ownGoalDirection + 180.0);
+			const int clearPower = (iPlayerId == 2 || iPlayerId == 3) ? 90 : 75;
+			sprintf(command, "(kick %d %.1f)", clearPower, clearDirection);
 		}
 		else {
-			const int advanceDirection = iPlayerId == 4 ? -12 : 12;
-			sprintf(command, "(kick 35 %d)", advanceDirection);
+			// 两门都不可见：先转身寻找，下周期再决策（避免盲踢回传危险区）。
+			sprintf(command, "(turn %d)", iPlayerId % 2 == 0 ? 40 : -40);
 		}
 		sendCmd(command);
 	}
