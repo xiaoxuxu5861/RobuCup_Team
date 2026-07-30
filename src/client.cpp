@@ -23,7 +23,7 @@
 #include "config.h"
 #endif
 
-#include "compress.h"
+//#include "compress.h"
 
 #include <rcssbase/net/socketstreambuf.hpp> //rcssbase可以实现网络连接、参数读取、序列化等一些通用的功能，是仿真比赛server 的底层库
 #include <rcssbase/net/udpsocket.hpp> //hpp,其实质就是将.cpp的实现代码混入.h头文件当中，定义与实现都包含在同一文件
@@ -60,6 +60,22 @@
 int iPlayerId = 0;
 int iSide = 0;//1:left;2:right
 int lastSeeCycle = -1;
+// ===== 守门员状态机 =====
+enum GoalieState {
+    GS_HOLDING,      // 守位（默认）
+    GS_ALIGNING,     // 横向调整
+    GS_CHASING,      // 迎球（威胁球）
+    GS_CATCHING,     // 正在扑球
+    GS_CLEARING,     // 接球后解围
+    GS_RETURNING     // 回门
+};
+
+GoalieState goalieState = GS_HOLDING;
+int goalieLastBallDistance = -1;
+int goalieLastBallCycle = -1;
+int goalieCatchAttemptCycle = -100;
+bool goalieCatchSuccess = false;
+int goalieStateEntryCycle = 0;
 int goalieCatchCycle = -100;
 std::string teamName = "RobuCupTeam";
 
@@ -325,76 +341,141 @@ private:
 	}
 
 	void handleGoalkeeper(const char *msg, int cycle) {
-		double ballDistance = 0.0;
-		double ballDirection = 0.0;
-		double goalDistance = 0.0;
-		double goalDirection = 0.0;
-		const int hasBall = readBallInfo(msg, ballDistance, ballDirection);
-		const int hasAttackGoal = readAttackGoalInfo(msg,
-				goalDistance, goalDirection);
-		char command[128];
+    double ballDistance = 0.0, ballDirection = 0.0;
+    double goalDistance = 0.0, goalDirection = 0.0;
+    const int hasBall = readBallInfo(msg, ballDistance, ballDirection);
+    const int hasAttackGoal = readAttackGoalInfo(msg, goalDistance, goalDirection);
+    char command[128];
 
-		// A catch attempt is followed by a clearance on the next observation.
-		if (goalieCatchCycle >= 0 && cycle - goalieCatchCycle <= 2) {
-			if (hasBall && ballDistance < 1.5) {
-				sprintf(command, "(kick 100 %.1f)",
-						hasAttackGoal ? goalDirection : 0.0);
-				goalieCatchCycle = -100;
-				sendCmd(command);
-				return;
-			}
-		}
-		else {
-			goalieCatchCycle = -100;
-		}
+    // 检测球速趋势（射门威胁判断）
+    bool ballApproaching = false;
+    if (goalieLastBallDistance > 0) {
+        ballApproaching = (ballDistance < goalieLastBallDistance - 0.3);
+    }
+    goalieLastBallDistance = (int)ballDistance;
+    goalieLastBallCycle = cycle;
 
-		if (!hasBall) {
-			if (makeDepthCommand(msg, 4.0, 9.0, command)) {
-				sendCmd(command);
-			}
-			else {
-				sprintf(command, "(turn 45)");
-				sendCmd(command);
-			}
-			return;
-		}
+    // 状态切换逻辑
+    switch (goalieState) {
+        case GS_HOLDING: {
+            // 球在禁区内且快速靠近 → 转为迎球
+            if (hasBall && ballDistance < 12.0 && ballApproaching) {
+                goalieState = GS_CHASING;
+                goalieStateEntryCycle = cycle;
+                break;
+            }
+            // 球在可扑范围内 → 转为扑球
+            if (hasBall && ballDistance <= 1.5) {
+                goalieState = GS_CATCHING;
+                goalieStateEntryCycle = cycle;
+                break;
+            }
+            // 保持守位：沿门线横向移动
+            if (hasBall) {
+                double alignDir = (ballDirection > 5.0) ? 15.0 : (ballDirection < -5.0 ? -15.0 : 0.0);
+                if (fabs(alignDir) > 1.0) {
+                    sprintf(command, "(turn %.1f)", alignDir);
+                    sendCmd(command);
+                } else {
+                    sprintf(command, "(dash 20)");
+                    sendCmd(command);
+                }
+            } else {
+                sprintf(command, "(turn 10)");
+                sendCmd(command);
+            }
+            break;
+        }
 
-		if (ballDistance <= 1.15) {
-			sprintf(command, "(catch %.1f)", ballDirection);
-			goalieCatchCycle = cycle;
-			sendCmd(command);
-			return;
-		}
+        case GS_CHASING: {
+            // 球靠近且可扑 → 转为扑球
+            if (hasBall && ballDistance <= 1.5) {
+                goalieState = GS_CATCHING;
+                goalieStateEntryCycle = cycle;
+                break;
+            }
+            // 球远离或超过12米 → 回门
+            if (!hasBall || ballDistance > 14.0) {
+                goalieState = GS_RETURNING;
+                goalieStateEntryCycle = cycle;
+                break;
+            }
+            // 迎球移动
+            if (ballDistance > 2.0) {
+                sprintf(command, "(dash 60)");
+                sendCmd(command);
+            } else {
+                sprintf(command, "(dash 30)");
+                sendCmd(command);
+            }
+            // 转向球
+            sprintf(command, "(turn %.1f)", ballDirection);
+            sendCmd(command);
+            break;
+        }
 
-		if (ballDistance <= 11.0) {
-			if (absDouble(ballDirection) > 10.0) {
-				sprintf(command, "(turn %.1f)", ballDirection);
-			}
-			else if (ballDistance > 6.0) {
-				sprintf(command, "(dash 70)");
-			}
-			else if (ballDistance > 3.0) {
-				sprintf(command, "(dash 45)");
-			}
-			else {
-				sprintf(command, "(dash 25)");
-			}
-			sendCmd(command);
-			return;
-		}
+        case GS_CATCHING: {
+            // 接球后解围
+            if (goalieCatchAttemptCycle > 0 && cycle - goalieCatchAttemptCycle <= 5) {
+                if (hasBall && ballDistance < 1.5) {
+                    double kickDir = hasAttackGoal ? goalDirection : 0.0;
+                    if (fabs(kickDir) > 45.0) kickDir = (kickDir > 0) ? 30.0 : -30.0;
+                    sprintf(command, "(kick 100 %.1f)", kickDir);
+                    sendCmd(command);
+                    goalieState = GS_CLEARING;
+                    goalieStateEntryCycle = cycle;
+                    goalieCatchAttemptCycle = -100;
+                    break;
+                }
+            }
+            // 尝试扑球
+            if (hasBall && ballDistance <= 1.15) {
+                sprintf(command, "(catch %.1f)", ballDirection);
+                goalieCatchAttemptCycle = cycle;
+                sendCmd(command);
+            } else if (hasBall && ballDistance <= 3.0) {
+                sprintf(command, "(dash 40)");
+                sendCmd(command);
+            } else {
+                // 没扑到，回门
+                goalieState = GS_RETURNING;
+                goalieStateEntryCycle = cycle;
+            }
+            break;
+        }
 
-		if (makeDepthCommand(msg, 4.0, 9.0, command)) {
-			sendCmd(command);
-		}
-		else if (absDouble(ballDirection) > 5.0) {
-			sprintf(command, "(turn %.1f)", ballDirection);
-			sendCmd(command);
-		}
-		else {
-			sprintf(command, "(turn 0)");
-			sendCmd(command);
-		}
-	}
+        case GS_CLEARING: {
+            // 解围后回到守位
+            if (cycle - goalieStateEntryCycle > 3) {
+                goalieState = GS_HOLDING;
+                goalieStateEntryCycle = cycle;
+            }
+            sprintf(command, "(turn 10)");
+            sendCmd(command);
+            break;
+        }
+
+        case GS_RETURNING: {
+            // 回到门线附近
+            if (ballDistance > 8.0 && ballDistance < 15.0) {
+                sprintf(command, "(dash -30)");
+                sendCmd(command);
+            } else {
+                goalieState = GS_HOLDING;
+                goalieStateEntryCycle = cycle;
+            }
+            sprintf(command, "(turn %.1f)", ballDirection);
+            sendCmd(command);
+            break;
+        }
+
+        default: {
+            goalieState = GS_HOLDING;
+            goalieStateEntryCycle = cycle;
+            break;
+        }
+    }
+}
 
 	void handleFieldPlayer(const char *msg) {
 		double ballDistance = 0.0;
