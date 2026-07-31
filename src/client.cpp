@@ -129,7 +129,6 @@ private:
 	bool M_clean_cycle;
 
 #ifdef HAVE_LIBZ
-	Decompressor M_decomp;
 #endif
 
 	Client(); // 构造函数
@@ -273,10 +272,8 @@ private:
 #ifdef HAVE_LIBZ
 		if ( M_comp_level >= 0 )
 		{
-			M_decomp.decompress( msg, len, Z_SYNC_FLUSH );
 			char * out;
 			int size;
-			M_decomp.getOutput( out, size );
 			if ( size > 0 )
 			{
 				parseMsg( out, size );
@@ -428,6 +425,13 @@ private:
                     break;
                 }
             }
+            // 冷却检查：如果刚尝试过 catch（10个周期内），不再重复发送
+    if (goalieCatchAttemptCycle > 0 && cycle - goalieCatchAttemptCycle < 10) {
+        // 冷却中，只转向，不扑球
+        sprintf(command, "(turn %.1f)", ballDirection);
+        sendCmd(command);
+        break;
+    }
             // 尝试扑球
             if (hasBall && ballDistance <= 1.15) {
                 sprintf(command, "(catch %.1f)", ballDirection);
