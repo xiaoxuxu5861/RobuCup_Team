@@ -108,10 +108,45 @@ struct MatchState {
 };
 
 MatchState gMatchState = { PM_UNKNOWN, 0, 0 };
+
+struct BodyState {
+	bool hasStamina;
+	double stamina;
+	double effort;
+	int cycle;
+};
+
+BodyState gBodyState = { false, 8000.0, 1.0, -1 };
 int lastHeardChaseUnum = 0;
 int lastHeardChaseCycle = -100;
+int lastPassTargetUnum = 0;
+int lastPassCycle = -100;
 int lastChaseSayCycle = -100;
 const char *gLastChaseReason = "none";
+const char *gLastAttackAction = "none";
+int lastForwardMode = 0; // 1 chase, 2 support
+int lastForwardModeCycle = -100;
+
+double absDouble(double value);
+double normalizeAngle(double angle);
+
+void clearTransientAttackState() {
+	lastHeardChaseUnum = 0;
+	lastHeardChaseCycle = -100;
+	lastPassTargetUnum = 0;
+	lastPassCycle = -100;
+	lastChaseSayCycle = -100;
+	lastForwardMode = 0;
+	lastForwardModeCycle = -100;
+	gLastChaseReason = "restart";
+	gLastAttackAction = "restart_wait";
+}
+
+bool isRestartHoldMode() {
+	return gMatchState.playMode == PM_BEFORE_KICK_OFF
+			|| gMatchState.playMode == PM_GOAL_L
+			|| gMatchState.playMode == PM_GOAL_R;
+}
 
 double estimateDistance(double selfToA, double selfToB,
 		double dirA, double dirB) {
@@ -185,6 +220,9 @@ bool parseRefereeMessage(const char *msg, MatchState &state) {
 	else {
 		state.playMode = PM_OTHER;
 	}
+	if (isRestartHoldMode()) {
+		clearTransientAttackState();
+	}
 	printf("referee_parse: playMode=%d\n", static_cast<int>(state.playMode));
 	return true;
 }
@@ -199,15 +237,112 @@ void handleHearMessage(const char *msg, int cycle) {
 	}
 
 	const char *quoted = std::strchr(msg, '"');
-	if (quoted == 0 || quoted[1] != 'c') {
+	if (quoted == 0) {
 		return;
 	}
+
+	if (quoted[1] == 'p') {
+		const int target = quoted[2] - '0';
+		if (target >= 2 && target <= 5) {
+			lastPassTargetUnum = target;
+			lastPassCycle = cycle;
+			printf("pass_heard: cycle=%d target=%d self=%d\n",
+					cycle, target, iPlayerId);
+		}
+		return;
+	}
+
+	if (quoted[1] != 'c') {
+		return;
+	}
+
 	const int claimed = quoted[2] - '0';
 	if (claimed < 2 || claimed > 5 || claimed == iPlayerId) {
 		return;
 	}
 	lastHeardChaseUnum = claimed;
 	lastHeardChaseCycle = cycle;
+}
+
+bool parseSenseBodyMessage(const char *msg) {
+	int cycle = -1;
+	if (std::sscanf(msg, "(sense_body %d", &cycle) != 1) {
+		return false;
+	}
+
+	const char *stamina = std::strstr(msg, "(stamina ");
+	if (stamina == 0) {
+		return false;
+	}
+
+	double value = 0.0;
+	double effort = 1.0;
+	if (std::sscanf(stamina, "(stamina %lf %lf", &value, &effort) < 1) {
+		return false;
+	}
+
+	gBodyState.hasStamina = true;
+	gBodyState.stamina = value;
+	gBodyState.effort = effort;
+	gBodyState.cycle = cycle;
+	printf("body_parse: cycle=%d stamina=%.1f effort=%.2f\n",
+			gBodyState.cycle, gBodyState.stamina, gBodyState.effort);
+	return true;
+}
+
+int limitPower(int value, int maximum) {
+	return value > maximum ? maximum : value;
+}
+
+int staminaDashPower(int basePower, bool chasing) {
+	if (!gBodyState.hasStamina) {
+		return basePower;
+	}
+	if (gBodyState.effort < 0.65) {
+		return chasing ? limitPower(basePower, 65) : limitPower(basePower, 25);
+	}
+	if (gBodyState.stamina < 1800.0) {
+		return chasing ? limitPower(basePower, 55) : limitPower(basePower, 20);
+	}
+	if (gBodyState.stamina < 3500.0) {
+		return chasing ? limitPower(basePower, 75) : limitPower(basePower, 35);
+	}
+	if (gBodyState.stamina < 5200.0) {
+		return chasing ? limitPower(basePower, 90) : limitPower(basePower, 45);
+	}
+	return basePower;
+}
+
+bool findTeammate(const VisualState &state, int unum, SeenPlayer &player) {
+	for (int i = 0; i < state.teammateCount; ++i) {
+		if (state.teammates[i].unum == unum) {
+			player = state.teammates[i];
+			return true;
+		}
+	}
+	return false;
+}
+
+bool hasNearbyOpponent(const VisualState &state, double distanceLimit) {
+	for (int i = 0; i < state.opponentCount; ++i) {
+		if (state.opponents[i].distance <= distanceLimit) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool hasOpponentInLane(const VisualState &state, double laneDirection,
+		double distanceLimit, double angleLimit) {
+	for (int i = 0; i < state.opponentCount; ++i) {
+		const double diff = normalizeAngle(state.opponents[i].direction
+				- laneDirection);
+		if (state.opponents[i].distance <= distanceLimit
+				&& absDouble(diff) <= angleLimit) {
+			return true;
+		}
+	}
+	return false;
 }
 
 bool shouldChaseBall(const VisualState &state, int playerId) {
@@ -666,9 +801,172 @@ private:
 		}
 	}
 
+	bool isForwardPlayer() {
+		return iPlayerId == 4 || iPlayerId == 5;
+	}
+
+	bool isFreshPassTarget(int cycle) {
+		return isForwardPlayer()
+				&& lastPassTargetUnum == iPlayerId
+				&& cycle - lastPassCycle >= 0
+				&& cycle - lastPassCycle <= 8;
+	}
+
+	int stableForwardChaseDecision(int mayChase, double ballDistance,
+			double chaseLimit, int cycle) {
+		if (!isForwardPlayer()) {
+			return mayChase;
+		}
+
+		const int desiredMode = (mayChase && ballDistance <= chaseLimit) ? 1 : 2;
+		if (lastForwardMode != 0 && desiredMode != lastForwardMode
+				&& cycle - lastForwardModeCycle < 4) {
+			return lastForwardMode == 1;
+		}
+
+		if (desiredMode != lastForwardMode) {
+			lastForwardMode = desiredMode;
+			lastForwardModeCycle = cycle;
+		}
+		return desiredMode == 1;
+	}
+
+	void logAttackDecision(int cycle, const VisualState &visual,
+			const char *action, const char *command) {
+		printf("attack_debug: cycle=%d id=%d action=%s stamina=%.1f ball=%.1f goal=%d %.1f partner=%d opp=%d command=%s\n",
+				cycle, iPlayerId, action,
+				gBodyState.hasStamina ? gBodyState.stamina : -1.0,
+				visual.hasBall ? visual.ballDistance : -1.0,
+				visual.hasAttackGoal ? 1 : 0,
+				visual.hasAttackGoal ? visual.attackGoalDistance : -1.0,
+				visual.teammateCount, visual.opponentCount, command);
+	}
+
+	void makeForwardSupportCommand(const VisualState &visual, char *command) {
+		const double supportOffset = iPlayerId == 5 ? 28.0 : -24.0;
+		const double laneDirection = normalizeAngle(visual.ballDirection
+				+ supportOffset);
+		const int supportPower = staminaDashPower(iPlayerId == 5 ? 55 : 45,
+				false);
+
+		if (visual.ballDistance < 6.0) {
+			gLastAttackAction = "support_widen";
+			if (absDouble(laneDirection) > 10.0) {
+				sprintf(command, "(turn %.1f)", laneDirection);
+			}
+			else {
+				sprintf(command, "(dash %d)", supportPower);
+			}
+			return;
+		}
+
+		if (visual.ballDistance > 18.0) {
+			gLastAttackAction = "support_catchup";
+			if (absDouble(visual.ballDirection) > 12.0) {
+				sprintf(command, "(turn %.1f)", visual.ballDirection);
+			}
+			else {
+				sprintf(command, "(dash %d)", supportPower);
+			}
+			return;
+		}
+
+		gLastAttackAction = "support_lane";
+		if (absDouble(laneDirection) > 16.0) {
+			sprintf(command, "(turn %.1f)", laneDirection);
+		}
+		else {
+			sprintf(command, "(dash %d)", staminaDashPower(40, false));
+		}
+	}
+
+	void makeForwardPossessionCommand(const VisualState &visual, int cycle,
+			char *command) {
+		const int partnerUnum = iPlayerId == 4 ? 5 : 4;
+		SeenPlayer partner;
+		const bool hasPartner = findTeammate(visual, partnerUnum, partner);
+		const bool underPressure = hasNearbyOpponent(visual, 5.0);
+		const bool goalBlocked = visual.hasAttackGoal
+				&& hasOpponentInLane(visual, visual.attackGoalDirection,
+						10.0, 18.0);
+
+		const bool usefulPass = hasPartner
+				&& partner.distance >= 4.0
+				&& partner.distance <= 24.0
+				&& absDouble(partner.direction) <= 55.0
+				&& ((iPlayerId == 4 && (underPressure || goalBlocked))
+						|| (iPlayerId == 5 && underPressure
+								&& (!visual.hasAttackGoal
+										|| visual.attackGoalDistance > 20.0)));
+		if (usefulPass) {
+			gLastAttackAction = "pass";
+			sprintf(command, "(kick 50 %.1f)(say p%d)",
+					partner.direction, partnerUnum);
+			return;
+		}
+
+		if (visual.hasAttackGoal && visual.attackGoalDistance <= 28.0
+				&& !goalBlocked) {
+			gLastAttackAction = "shoot";
+			const int shootPower = gBodyState.hasStamina
+					&& gBodyState.stamina < 3000.0 ? 82 : 100;
+			sprintf(command, "(kick %d %.1f)", shootPower,
+					visual.attackGoalDirection);
+			return;
+		}
+
+		if (!visual.hasAttackGoal) {
+			gLastAttackAction = "advance_scan";
+			if (absDouble(visual.ballDirection) > 8.0) {
+				sprintf(command, "(turn %.1f)", visual.ballDirection);
+			}
+			else if (visual.ballDistance <= 0.55) {
+				const double scanDirection = iPlayerId == 4 ? 32.0 : -32.0;
+				sprintf(command, "(turn %.1f)", scanDirection);
+			}
+			else {
+				const double safeTouchDirection = iPlayerId == 4 ? 18.0 : -18.0;
+				sprintf(command, "(kick 8 %.1f)", safeTouchDirection);
+			}
+			return;
+		}
+
+		if (visual.attackGoalDistance > 34.0) {
+			gLastAttackAction = "dribble_touch";
+			if (absDouble(visual.attackGoalDirection) > 25.0) {
+				sprintf(command, "(turn %.1f)", visual.attackGoalDirection);
+			}
+			else {
+				sprintf(command, "(kick 16 %.1f)", visual.attackGoalDirection);
+			}
+		}
+		else {
+			gLastAttackAction = "advance_touch";
+			if (absDouble(visual.attackGoalDirection) > 35.0) {
+				sprintf(command, "(turn %.1f)", visual.attackGoalDirection);
+			}
+			else {
+				sprintf(command, "(kick 24 %.1f)", visual.attackGoalDirection);
+			}
+		}
+		(void)cycle;
+	}
+
 	void handleFieldPlayer(const char *msg, const VisualState &visual,
 			int cycle) {
 		char command[160];
+
+		if (isRestartHoldMode()) {
+			gLastAttackAction = "restart_wait";
+			if (isForwardPlayer()) {
+				logAttackDecision(cycle, visual, gLastAttackAction, "none");
+			}
+			if (visual.hasBall && absDouble(visual.ballDirection) > 12.0) {
+				sprintf(command, "(turn %.1f)", visual.ballDirection);
+				sendCmd(command);
+			}
+			return;
+		}
 
 		if (!visual.hasBall) {
 			sprintf(command, "(turn %d)", iPlayerId % 2 == 0 ? 45 : -45);
@@ -704,12 +1002,27 @@ private:
 		}
 
 		const int mayChase = shouldChaseBall(visual, iPlayerId);
-		printf("chase_debug: cycle=%d id=%d side=%d srvSide=%d playMode=%d ball=%.1f tm=%d chase=%d reason=%s\n",
+		const int passTarget = isFreshPassTarget(cycle);
+		printf("chase_debug: cycle=%d id=%d side=%d srvSide=%d playMode=%d ball=%.1f tm=%d chase=%d pass=%d reason=%s\n",
 				cycle, iPlayerId, iSide, gMatchState.sideFromServer,
 				static_cast<int>(gMatchState.playMode), ballDistance,
-				visual.teammateCount, mayChase, gLastChaseReason);
+				visual.teammateCount, mayChase, passTarget, gLastChaseReason);
+		int activeChase = stableForwardChaseDecision(mayChase,
+				ballDistance, chaseLimit, cycle);
+		double effectiveChaseLimit = chaseLimit;
+		if (passTarget) {
+			activeChase = 1;
+			effectiveChaseLimit = 30.0;
+			gLastAttackAction = "receive";
+		}
 
-		if (!mayChase || ballDistance > chaseLimit) {
+		if (!activeChase || ballDistance > effectiveChaseLimit) {
+			if (isForwardPlayer()) {
+				makeForwardSupportCommand(visual, command);
+				logAttackDecision(cycle, visual, gLastAttackAction, command);
+				sendCmd(command);
+				return;
+			}
 			if (makeDepthCommand(msg, minimumHomeDistance,
 					maximumHomeDistance, command)) {
 				sendCmd(command);
@@ -728,9 +1041,16 @@ private:
 		if (ballDistance > 0.75) {
 			if (absDouble(ballDirection) > 12.0) {
 				sprintf(command, "(turn %.1f)", ballDirection);
+				if (isForwardPlayer()) {
+					gLastAttackAction = passTarget ? "receive_turn" : "chase_turn";
+				}
 			}
 			else {
-				const int dashPower = iPlayerId <= 3 ? 75 : 90;
+				int dashPower = iPlayerId <= 3 ? 82 : 100;
+				if (isForwardPlayer() && ballDistance < 4.0) {
+					dashPower = passTarget ? 80 : 75;
+				}
+				dashPower = staminaDashPower(dashPower, true);
 				if (cycle - lastChaseSayCycle >= 4) {
 					sprintf(command, "(dash %d)(say c%d)", dashPower, iPlayerId);
 					lastChaseSayCycle = cycle;
@@ -738,7 +1058,20 @@ private:
 				else {
 					sprintf(command, "(dash %d)", dashPower);
 				}
+				if (isForwardPlayer()) {
+					gLastAttackAction = passTarget ? "receive_dash" : "chase_dash";
+				}
 			}
+			if (isForwardPlayer()) {
+				logAttackDecision(cycle, visual, gLastAttackAction, command);
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (isForwardPlayer()) {
+			makeForwardPossessionCommand(visual, cycle, command);
+			logAttackDecision(cycle, visual, gLastAttackAction, command);
 			sendCmd(command);
 			return;
 		}
@@ -789,8 +1122,13 @@ private:
 			return;
 		}
 
-		if (!std::strncmp(msg, "(sense_body", 11)
-				|| !std::strncmp(msg, "(see_global", 11)) {
+		if (!std::strncmp(msg, "(sense_body", 11)) {
+			parseSenseBodyMessage(msg);
+			M_clean_cycle = true;
+			return;
+		}
+
+		if (!std::strncmp(msg, "(see_global", 11)) {
 			M_clean_cycle = true;
 		}
 
