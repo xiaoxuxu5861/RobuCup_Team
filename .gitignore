@@ -6,6 +6,7 @@
 !/.gitattributes
 !/开发规范.md
 !/run.sh
+!/run_vs_uva.sh
 !/src/
 !/log/
 
