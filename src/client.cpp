@@ -122,6 +122,21 @@ int lastHeardChaseUnum = 0;
 int lastHeardChaseCycle = -100;
 int lastChaseSayCycle = -100;
 const char *gLastChaseReason = "none";
+int defenderAdvanceSteps = 0;
+
+struct DefenderRole {
+	double normalMinimumGoalDistance;
+	double normalMaximumGoalDistance;
+	int flankSign;
+};
+
+DefenderRole defenderRole(int playerId) {
+	DefenderRole role;
+	role.normalMinimumGoalDistance = playerId == 2 ? 18.0 : 20.0;
+	role.normalMaximumGoalDistance = playerId == 2 ? 27.0 : 29.0;
+	role.flankSign = playerId == 2 ? -1 : 1;
+	return role;
+}
 
 double estimateDistance(double selfToA, double selfToB,
 		double dirA, double dirB) {
@@ -666,9 +681,228 @@ private:
 		}
 	}
 
+	bool findVisibleTeammate(const VisualState &visual, int unum,
+			SeenPlayer &teammate) {
+		for (int i = 0; i < visual.teammateCount; ++i) {
+			if (visual.teammates[i].unum == unum) {
+				teammate = visual.teammates[i];
+				return true;
+			}
+		}
+		return false;
+	}
+
+	double ballDistanceFromOwnGoal(const VisualState &visual) {
+		if (!visual.hasBall || !visual.hasOwnGoal) {
+			return 1000.0;
+		}
+		return estimateDistance(visual.ballDistance,
+				visual.ownGoalDistance, visual.ballDirection,
+				visual.ownGoalDirection);
+	}
+
+	bool ballInDefenderZone(const VisualState &visual,
+			const DefenderRole &role, bool partnerVisible) {
+		if (!partnerVisible || !visual.hasOwnGoal) {
+			return true;
+		}
+		const double threatSide = normalizeAngle(
+				visual.ballDirection - visual.ownGoalDirection);
+		return threatSide * role.flankSign >= -8.0;
+	}
+
+	void defenderDepthRange(const VisualState &visual,
+			const DefenderRole &role, double &minimumDistance,
+			double &maximumDistance) {
+		const double ballGoalDistance = ballDistanceFromOwnGoal(visual);
+		if (ballGoalDistance < 18.0) {
+			minimumDistance = 15.0;
+			maximumDistance = 22.0;
+		}
+		else if (ballGoalDistance < 34.0) {
+			minimumDistance = role.normalMinimumGoalDistance;
+			maximumDistance = role.normalMaximumGoalDistance;
+		}
+		else {
+			minimumDistance = role.normalMinimumGoalDistance + 3.0;
+			maximumDistance = role.normalMaximumGoalDistance + 3.0;
+		}
+	}
+
+	bool makeDefenderReturnCommand(const VisualState &visual,
+			const DefenderRole &role, char *command) {
+		double minimumDistance = 0.0;
+		double maximumDistance = 0.0;
+		defenderDepthRange(visual, role, minimumDistance, maximumDistance);
+
+		if (!visual.hasOwnGoal) {
+			if (defenderAdvanceSteps > 0) {
+				sprintf(command, "(dash -45)");
+				--defenderAdvanceSteps;
+			}
+			else {
+				sprintf(command, "(turn %d)", role.flankSign * 35);
+			}
+			return true;
+		}
+
+		double moveDirection = 0.0;
+		if (visual.ownGoalDistance > maximumDistance) {
+			moveDirection = visual.ownGoalDirection;
+		}
+		else if (visual.ownGoalDistance < minimumDistance) {
+			moveDirection = normalizeAngle(
+					visual.ownGoalDirection + 180.0);
+		}
+		else {
+			return false;
+		}
+
+		if (absDouble(moveDirection) > 12.0) {
+			sprintf(command, "(turn %.1f)", moveDirection);
+		}
+		else {
+			sprintf(command, "(dash 55)");
+			if (visual.ownGoalDistance > maximumDistance
+					&& defenderAdvanceSteps > 0) {
+				--defenderAdvanceSteps;
+			}
+		}
+		return true;
+	}
+
+	void makeDefenderClearCommand(const VisualState &visual,
+			const DefenderRole &role, char *command) {
+		double clearDirection = role.flankSign * 55.0;
+		if (visual.hasAttackGoal
+				&& absDouble(visual.attackGoalDirection) <= 90.0) {
+			clearDirection = visual.attackGoalDirection;
+		}
+		else if (visual.hasOwnGoal) {
+			clearDirection = normalizeAngle(
+					visual.ownGoalDirection + 180.0);
+		}
+		sprintf(command, "(kick 100 %.1f)", clearDirection);
+	}
+
+	void handleDefender(const VisualState &visual, int cycle,
+			bool mayChase) {
+		char command[160];
+		const DefenderRole role = defenderRole(iPlayerId);
+		const int partnerUnum = iPlayerId == 2 ? 3 : 2;
+		SeenPlayer partner;
+		const bool partnerVisible = findVisibleTeammate(
+				visual, partnerUnum, partner);
+
+		if (gMatchState.playMode == PM_BEFORE_KICK_OFF
+				|| gMatchState.playMode == PM_GOAL_L
+				|| gMatchState.playMode == PM_GOAL_R) {
+			double x = 0.0;
+			double y = 0.0;
+			formationPosition(iPlayerId, x, y);
+			sprintf(command, "(move %.1f %.1f)", x, y);
+			defenderAdvanceSteps = 0;
+			sendCmd(command);
+			return;
+		}
+
+		if (!visual.hasBall) {
+			if (!makeDefenderReturnCommand(visual, role, command)) {
+				sprintf(command, "(turn %d)", role.flankSign * 35);
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (visual.ballDistance <= 0.75) {
+			makeDefenderClearCommand(visual, role, command);
+			sendCmd(command);
+			return;
+		}
+
+		const double ballGoalDistance = ballDistanceFromOwnGoal(visual);
+		const bool emergency = ballGoalDistance < 18.0
+				|| (visual.hasOwnGoal
+						&& visual.ownGoalDistance < 24.0
+						&& visual.ballDistance < 8.0);
+		const bool ownZone = ballInDefenderZone(
+				visual, role, partnerVisible);
+		const int advanceLimit = emergency ? 9 : 6;
+		const bool insideBoundary = !visual.hasOwnGoal
+				? defenderAdvanceSteps < advanceLimit
+				: visual.ownGoalDistance < 32.0;
+		const bool shouldChallenge = mayChase && insideBoundary
+				&& (emergency || ownZone);
+
+		printf("defense_debug: cycle=%d id=%d ballGoal=%.1f zone=%d emergency=%d chase=%d steps=%d\n",
+				cycle, iPlayerId, ballGoalDistance, ownZone ? 1 : 0,
+				emergency ? 1 : 0, shouldChallenge ? 1 : 0,
+				defenderAdvanceSteps);
+
+		if (shouldChallenge) {
+			if (absDouble(visual.ballDirection) > 12.0) {
+				sprintf(command, "(turn %.1f)", visual.ballDirection);
+			}
+			else {
+				const int dashPower = emergency ? 95 : 75;
+				if (cycle - lastChaseSayCycle >= 4) {
+					sprintf(command, "(dash %d)(say c%d)",
+							dashPower, iPlayerId);
+					lastChaseSayCycle = cycle;
+				}
+				else {
+					sprintf(command, "(dash %d)", dashPower);
+				}
+				if (defenderAdvanceSteps < advanceLimit) {
+					++defenderAdvanceSteps;
+				}
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (partnerVisible && partner.distance < 7.0) {
+			const double separateDirection = normalizeAngle(
+					partner.direction + 180.0);
+			if (absDouble(separateDirection) > 12.0) {
+				sprintf(command, "(turn %.1f)", separateDirection);
+			}
+			else {
+				sprintf(command, "(dash 35)");
+			}
+			sendCmd(command);
+			return;
+		}
+
+		if (makeDefenderReturnCommand(visual, role, command)) {
+			sendCmd(command);
+			return;
+		}
+
+		if (absDouble(visual.ballDirection) > 7.0) {
+			sprintf(command, "(turn %.1f)", visual.ballDirection);
+		}
+		else {
+			sprintf(command, "(turn %d)", role.flankSign * 20);
+		}
+		sendCmd(command);
+	}
+
 	void handleFieldPlayer(const char *msg, const VisualState &visual,
 			int cycle) {
 		char command[160];
+		const int mayChase = shouldChaseBall(visual, iPlayerId);
+
+		printf("chase_debug: cycle=%d id=%d side=%d srvSide=%d playMode=%d ball=%.1f tm=%d chase=%d reason=%s\n",
+				cycle, iPlayerId, iSide, gMatchState.sideFromServer,
+				static_cast<int>(gMatchState.playMode),
+				visual.hasBall ? visual.ballDistance : -1.0,
+				visual.teammateCount, mayChase, gLastChaseReason);
+
+		if (iPlayerId == 2 || iPlayerId == 3) {
+			handleDefender(visual, cycle, mayChase != 0);
+			return;
+		}
 
 		if (!visual.hasBall) {
 			sprintf(command, "(turn %d)", iPlayerId % 2 == 0 ? 45 : -45);
@@ -703,12 +937,6 @@ private:
 			maximumHomeDistance = 45.0;
 		}
 
-		const int mayChase = shouldChaseBall(visual, iPlayerId);
-		printf("chase_debug: cycle=%d id=%d side=%d srvSide=%d playMode=%d ball=%.1f tm=%d chase=%d reason=%s\n",
-				cycle, iPlayerId, iSide, gMatchState.sideFromServer,
-				static_cast<int>(gMatchState.playMode), ballDistance,
-				visual.teammateCount, mayChase, gLastChaseReason);
-
 		if (!mayChase || ballDistance > chaseLimit) {
 			if (makeDepthCommand(msg, minimumHomeDistance,
 					maximumHomeDistance, command)) {
@@ -719,7 +947,8 @@ private:
 				sendCmd(command);
 			}
 			else {
-				sprintf(command, "(turn 0)");
+				sprintf(command, "(turn %d)",
+						iPlayerId % 2 == 0 ? 20 : -20);
 				sendCmd(command);
 			}
 			return;
