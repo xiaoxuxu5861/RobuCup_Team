@@ -7,6 +7,11 @@
 !/开发规范.md
 !/run.sh
 !/src/
+!/log/
 
 /src/*
 !/src/client.cpp
+
+/log/*
+!/log/*.rcg
+!/log/*.rcl

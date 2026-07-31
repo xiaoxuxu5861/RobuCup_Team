@@ -11,6 +11,8 @@
 *.am text eol=lf
 *.in text eol=lf
 *.m4 text eol=lf
+*.rcg text eol=lf
+*.rcl text eol=lf
 
 configure text eol=lf
 config.guess text eol=lf
