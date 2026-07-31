@@ -49,8 +49,8 @@ done
 
 sleep 1
 
-# Use a balanced five-player subset: goalie, two defenders and two attackers.
-for formation_number in 1 2 3 9 10; do
+# Use mirrored pairs: goalie, left/right defenders and left/right attackers.
+for formation_number in 1 2 5 10 11; do
     "$UVA_PLAYER" \
         -number "$formation_number" \
         -host "$RCSS_SERVER" \
