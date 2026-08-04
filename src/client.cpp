@@ -912,7 +912,9 @@ private:
 		sprintf(command, "(move %.1f %.1f)", startX, startY);
 		if (!sendCmd(command)) return;
 
-		sprintf(command, "(change_view narrow high)");
+		sprintf(command, iPlayerId == 1
+				? "(change_view normal high)"
+				: "(change_view narrow high)");
 		if (!sendCmd(command)) return;
 
 		sprintf(command, "(synch_see)");
@@ -1148,12 +1150,13 @@ private:
 		return true;
 	}
 
-	void makeTurnOrDashCommand(double direction, int power, char *command) {
-		if (absDouble(direction) > 100.0) {
+	void makeTurnOrDashCommand(double direction, int power, char *command,
+			double turnThreshold = 18.0) {
+		if (absDouble(direction) > turnThreshold) {
 			sprintf(command, "(turn %.1f)", direction);
 		}
 		else {
-			sprintf(command, "(dash %d %.1f)", power, direction);
+			sprintf(command, "(dash %d 0)", power);
 		}
 	}
 
@@ -1163,6 +1166,24 @@ private:
 			return;
 		}
 		double moment = visual.ballNeckDirection;
+		double bodyTurn = 0.0;
+		if (std::sscanf(command, "(turn %lf", &bodyTurn) == 1) {
+			moment = normalizeAngle(moment - bodyTurn);
+		}
+		if (moment > 90.0) moment = 90.0;
+		if (moment < -90.0) moment = -90.0;
+		char neck[48];
+		sprintf(neck, "(turn_neck %.1f)", moment);
+		if (std::strlen(command) + std::strlen(neck) + 1 < capacity) {
+			std::strcat(command, neck);
+		}
+	}
+
+	void appendCenterNeckCommand(char *command, size_t capacity) {
+		if (std::strstr(command, "(turn_neck ") != 0) {
+			return;
+		}
+		double moment = -gBodyState.headAngle;
 		if (moment > 90.0) moment = 90.0;
 		if (moment < -90.0) moment = -90.0;
 		char neck[48];
@@ -1280,7 +1301,7 @@ private:
 			}
 		}
 		else {
-			sprintf(command, "(dash -55)");
+			sprintf(command, "(dash -80)");
 			if (goalieAdvanceSteps > 0) --goalieAdvanceSteps;
 		}
 	}
@@ -1330,7 +1351,7 @@ private:
 
 		const double targetDirection = std::atan2(targetY, targetX) / radians;
 		makeTurnOrDashCommand(targetDirection,
-				staminaDashPower(68, true), command);
+				staminaDashPower(68, true), command, 100.0);
 		if (std::strncmp(command, "(dash", 5) == 0) {
 			appendBallNeckCommand(visual, command, 160);
 		}
@@ -1396,13 +1417,13 @@ private:
 				: 1000.0;
 		const bool catchAreaConfirmed = visual.hasOwnGoal
 				? ballToOwnGoal <= 16.0
-				: goalieAdvanceSteps <= 3;
+				: goalieAdvanceSteps <= 2;
 		const bool fastApproachingShot = visual.hasBall
 				&& gBallTrack.hasMotion
 				&& gBallTrack.closingStreak >= 2
 				&& gBallTrack.closingRate > 0.25
 				&& visual.ballDistance <= 18.0;
-		const double catchReach = 1.5;
+		const double catchReach = fastApproachingShot ? 1.75 : 1.5;
 		if (goalieState == GS_CATCHING
 				&& cycle > goalieCatchAttemptCycle && visual.hasBall) {
 			goalieState = GS_CHASING;
@@ -1451,22 +1472,37 @@ private:
 				continueDirection = clampDouble(
 						continueDirection, -75.0, 75.0);
 				makeTurnOrDashCommand(continueDirection,
-						staminaDashPower(100, true), command);
+						staminaDashPower(100, true), command, 100.0);
 			}
 			else if (goalieAdvanceSteps > 0) {
 				goalieState = GS_RETURNING;
 				makeGoalkeeperReturnCommand(visual, command);
 			}
-			else if (unseenCycles >= 0 && unseenCycles <= 2) {
-				double searchDirection = goalieLastBallDirection
-						+ gBallTrack.directionRate * 2.0;
-				searchDirection = clampDouble(
-						searchDirection, -90.0, 90.0);
-				sprintf(command, "(turn %.1f)", searchDirection);
+			else if (visual.hasOwnGoal) {
+				const double faceFieldDirection = normalizeAngle(
+						visual.ownGoalDirection + 180.0);
+				if (absDouble(faceFieldDirection) > 10.0) {
+					sprintf(command, "(turn %.1f)", faceFieldDirection);
+				}
+				else {
+					const double scanTarget = (cycle / 3) % 2 == 0
+							? -65.0 : 65.0;
+					const double neckMoment = clampDouble(
+							scanTarget - gBodyState.headAngle,
+							-180.0, 180.0);
+					sprintf(command, "(turn 0)(turn_neck %.1f)",
+							neckMoment);
+				}
 			}
 			else {
-				sprintf(command, "(turn 25)");
+				const double scanTarget = (cycle / 3) % 2 == 0
+						? -65.0 : 65.0;
+				const double neckMoment = clampDouble(
+						scanTarget - gBodyState.headAngle,
+						-180.0, 180.0);
+				sprintf(command, "(turn 0)(turn_neck %.1f)", neckMoment);
 			}
+			appendCenterNeckCommand(command, sizeof(command));
 			sendCmd(command);
 			return;
 		}
@@ -1474,14 +1510,14 @@ private:
 		// 1. 球近距离快速逼近或在禁区内：主动冲出拦截
 		const bool looseBallInArea = visual.ballDistance <= 7.5
 				&& (!visual.hasOwnGoal || ballToOwnGoal <= 17.0);
-		const bool canAdvance = goalieAdvanceSteps < 3
-				&& (!visual.hasOwnGoal || visual.ownGoalDistance <= 8.0);
+		const bool canAdvance = goalieAdvanceSteps < 2
+				&& (!visual.hasOwnGoal || visual.ownGoalDistance <= 6.5);
 		if ((fastApproachingShot && visual.ballDistance <= 12.0
 					&& canAdvance)
-				|| (looseBallInArea && goalieAdvanceSteps < 5
+				|| (looseBallInArea && canAdvance
 						&& isLikelyFirstToBall(visual, 0.5))) {
 			makeTurnOrDashCommand(predictedBallDirection(visual, 2),
-					100, command);
+					100, command, 100.0);
 			if (std::strncmp(command, "(dash", 5) == 0) {
 				++goalieAdvanceSteps;
 				appendBallNeckCommand(visual, command, sizeof(command));
@@ -1496,7 +1532,7 @@ private:
 				&& visual.ownGoalDistance > 5.8;
 		if (goalieState == GS_RETURNING || tooFarFromGoal
 				|| (goalieAdvanceSteps > 0
-						&& visual.ballDistance > 12.0)) {
+						&& visual.ballDistance > 8.0)) {
 			goalieState = GS_RETURNING;
 			makeGoalkeeperReturnCommand(visual, command);
 			appendBallNeckCommand(visual, command, sizeof(command));
@@ -1752,7 +1788,32 @@ private:
 	}
 
 	void makeDefenderClearCommand(const VisualState &visual, char *command) {
-		double clearDirection = iPlayerId == 2 ? 55.0 : -55.0;
+		SeenPlayer receiver = { 0, 0.0, 0.0 };
+		double receiverPressure = 1000.0;
+		for (int unum = 4; unum <= 5; ++unum) {
+			SeenPlayer candidate;
+			if (!findTeammate(visual, unum, candidate)
+					|| candidate.distance < 5.0
+					|| candidate.distance > 32.0
+					|| hasOpponentInLane(visual, candidate.direction,
+							candidate.distance - 1.0, 12.0)) {
+				continue;
+			}
+			const double pressure = lanePressure(
+					visual, candidate.direction);
+			if (pressure < receiverPressure) {
+				receiver = candidate;
+				receiverPressure = pressure;
+			}
+		}
+		if (receiver.unum != 0) {
+			const int passPower = kickPowerForDistance(receiver.distance);
+			sprintf(command, "(kick %d %.1f)(say \"p%d\")",
+					passPower, receiver.direction, receiver.unum);
+			return;
+		}
+
+		double clearDirection = 0.0;
 		if (visual.hasAttackGoal) {
 			clearDirection = visual.attackGoalDirection;
 		}
@@ -1796,14 +1857,14 @@ private:
 
 		const double unitX = lineX / ballToGoal;
 		const double unitY = lineY / ballToGoal;
-		double depth = clampDouble(10.0 + ballToGoal * 0.22, 10.0, 23.0);
+		double depth = clampDouble(9.0 + ballToGoal * 0.16, 9.0, 20.0);
 		if (iPlayerId == 3) {
-			depth = clampDouble(7.0 + ballToGoal * 0.12, 8.0, 16.0);
+			depth = clampDouble(7.0 + ballToGoal * 0.10, 8.0, 13.0);
 		}
 		if (depth > ballToGoal - 2.0) {
 			depth = ballToGoal > 6.0 ? ballToGoal - 2.0 : 4.0;
 		}
-		const double laneOffset = iPlayerId == 2 ? -3.5 : 3.5;
+		const double laneOffset = iPlayerId == 2 ? -2.0 : 2.0;
 		const double targetX = goalX + unitX * depth - unitY * laneOffset;
 		const double targetY = goalY + unitY * depth + unitX * laneOffset;
 		const double targetDistance = std::sqrt(
@@ -1837,9 +1898,19 @@ private:
 		}
 
 		if (!visual.hasBall) {
-			if (visual.hasOwnGoal && visual.ownGoalDistance > 21.0) {
+			const double homeLimit = iPlayerId == 2 ? 21.0 : 16.0;
+			const double attackGoalMinimum = iPlayerId == 2 ? 78.0 : 86.0;
+			if (visual.hasOwnGoal
+					&& visual.ownGoalDistance > homeLimit) {
 				makeTurnOrDashCommand(visual.ownGoalDirection,
 						staminaDashPower(62, false), command);
+			}
+			else if (visual.hasAttackGoal
+					&& visual.attackGoalDistance < attackGoalMinimum) {
+				const double homeDirection = normalizeAngle(
+						visual.attackGoalDirection + 180.0);
+				makeTurnOrDashCommand(homeDirection,
+						staminaDashPower(70, false), command);
 			}
 			else {
 				sprintf(command, "(turn %d)", iPlayerId == 2 ? 25 : -25);
@@ -1873,15 +1944,22 @@ private:
 			return;
 		}
 
-		const double laneOffset = iPlayerId == 2 ? -16.0 : 16.0;
-		const double laneDirection = normalizeAngle(
-				visual.ballDirection + laneOffset);
-		const int basePower = iPlayerId == 2
-				? (visual.ballDistance > 34.0 ? 78 : 68)
-				: 55;
-		makeTurnOrDashCommand(laneDirection,
-				staminaDashPower(basePower, false), command);
-		if (std::strncmp(command, "(dash", 5) == 0) {
+		const double attackGoalMinimum = iPlayerId == 2 ? 78.0 : 86.0;
+		if (visual.hasAttackGoal
+				&& visual.attackGoalDistance < attackGoalMinimum) {
+			const double homeDirection = normalizeAngle(
+					visual.attackGoalDirection + 180.0);
+			makeTurnOrDashCommand(homeDirection,
+					staminaDashPower(78, true), command);
+			if (std::strncmp(command, "(dash", 5) == 0) {
+				appendBallNeckCommand(visual, command, 160);
+			}
+		}
+		else if (absDouble(visual.ballDirection) > 12.0) {
+			sprintf(command, "(turn %.1f)", visual.ballDirection);
+		}
+		else {
+			sprintf(command, "(turn 0)");
 			appendBallNeckCommand(visual, command, 160);
 		}
 	}
@@ -1904,6 +1982,7 @@ private:
 				makeDefenderShapeCommand(visual,
 						defenderMode == DM_RECOVER, command);
 			}
+			appendCenterNeckCommand(command, sizeof(command));
 			sendCmd(command);
 			return;
 		}
@@ -1966,8 +2045,9 @@ private:
 		const bool lastLineEmergency = iPlayerId == 3
 				&& visual.ballDistance <= 16.0
 				&& (!visual.hasOwnGoal || ballToOwnGoal <= 24.0);
+		const double challengeLimit = iPlayerId == 2 ? 24.0 : 16.0;
 		const bool shouldChallenge = (!partnerCloser || lastLineEmergency)
-				&& (emergency || visual.ballDistance <= 32.0);
+				&& visual.ballDistance <= challengeLimit;
 		DefenderMode desiredMode = shouldChallenge
 				? DM_CHALLENGE : (emergency ? DM_RECOVER : DM_SHAPE);
 
@@ -2072,6 +2152,7 @@ private:
 						iPlayerId % 2 == 0 ? 30 : -30);
 				gLastAttackAction = "search_ball";
 			}
+			appendCenterNeckCommand(command, sizeof(command));
 			sendCmd(command);
 			return;
 		}
@@ -2110,7 +2191,7 @@ private:
 
 		if (ballDistance > 1.05) {
 			const double chaseDir = predictedBallDirection(visual, 3);
-			if (absDouble(chaseDir) > 100.0) {
+			if (absDouble(chaseDir) > 18.0) {
 				sprintf(command, "(turn %.1f)", chaseDir);
 				gLastAttackAction = passTarget
 						? "receive_turn" : "chase_turn";
@@ -2122,13 +2203,12 @@ private:
 				}
 				dashPower = staminaDashPower(dashPower, true);
 				if (cycle - lastChaseSayCycle >= 5) {
-					sprintf(command, "(dash %d %.1f)(say \"c%d\")",
-							dashPower, chaseDir, iPlayerId);
+					sprintf(command, "(dash %d 0)(say \"c%d\")",
+							dashPower, iPlayerId);
 					lastChaseSayCycle = cycle;
 				}
 				else {
-					sprintf(command, "(dash %d %.1f)",
-							dashPower, chaseDir);
+					sprintf(command, "(dash %d 0)", dashPower);
 				}
 				gLastAttackAction = passTarget
 						? "receive_dash" : "chase_dash";
