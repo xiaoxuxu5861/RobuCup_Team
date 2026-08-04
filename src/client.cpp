@@ -177,13 +177,15 @@ MatchState gMatchState = { PM_UNKNOWN, 0, 0 };
 
 struct BodyState {
 	bool hasStamina;
+	bool hasSpeed;
 	double stamina;
 	double effort;
+	double speed;
 	double headAngle;
 	int cycle;
 };
 
-BodyState gBodyState = { false, 8000.0, 1.0, 0.0, -1 };
+BodyState gBodyState = { false, false, 8000.0, 1.0, 0.0, 0.0, -1 };
 int lastHeardChaseUnum = 0;
 int lastHeardChaseCycle = -100;
 int lastPassTargetUnum = 0;
@@ -205,9 +207,30 @@ const char *gLastChaseReason = "none";
 const char *gLastAttackAction = "none";
 int lastForwardMode = 0; // 1 chase, 2 support
 int lastForwardModeCycle = -100;
+bool hasAttackDirectionEstimate = false;
+double attackDirectionEstimate = 0.0;
+int attackDirectionLandmarkCycle = -100;
 
 double absDouble(double value);
 double normalizeAngle(double angle);
+
+bool getAttackDirection(const VisualState &state, double &direction) {
+	if (state.hasAttackGoal) {
+		direction = state.attackGoalDirection;
+		return true;
+	}
+	if (state.hasOwnGoal) {
+		direction = normalizeAngle(state.ownGoalDirection + 180.0);
+		return true;
+	}
+	if (hasAttackDirectionEstimate
+			&& state.cycle - attackDirectionLandmarkCycle >= 0
+			&& state.cycle - attackDirectionLandmarkCycle <= 300) {
+		direction = attackDirectionEstimate;
+		return true;
+	}
+	return false;
+}
 
 void clearTransientAttackState() {
 	lastHeardChaseUnum = 0;
@@ -588,14 +611,19 @@ bool parseSenseBodyMessage(const char *msg) {
 	gBodyState.hasStamina = true;
 	gBodyState.stamina = value;
 	gBodyState.effort = effort;
+	const char *speed = std::strstr(msg, "(speed ");
+	if (speed != 0 && std::sscanf(speed, "(speed %lf",
+			&gBodyState.speed) == 1) {
+		gBodyState.hasSpeed = true;
+	}
 	const char *headAngle = std::strstr(msg, "(head_angle ");
 	if (headAngle != 0) {
 		std::sscanf(headAngle, "(head_angle %lf", &gBodyState.headAngle);
 	}
 	gBodyState.cycle = cycle;
-	printf("body_parse: cycle=%d stamina=%.1f effort=%.2f head=%.1f\n",
+	printf("body_parse: cycle=%d stamina=%.1f effort=%.2f speed=%.2f head=%.1f\n",
 			gBodyState.cycle, gBodyState.stamina, gBodyState.effort,
-			gBodyState.headAngle);
+			gBodyState.speed, gBodyState.headAngle);
 	return true;
 }
 
@@ -942,6 +970,16 @@ public: // 构造函数初始化列表以一个冒号开始，接着是以逗号
 			printf("error send socket\n");
 			return false;
 		}
+		double turnMoment = 0.0;
+		if (hasAttackDirectionEstimate
+				&& std::sscanf(command, "(turn %lf", &turnMoment) == 1) {
+			turnMoment = clampDouble(turnMoment, -180.0, 180.0);
+			const double speed = gBodyState.hasSpeed
+					? gBodyState.speed : 0.0;
+			const double actualTurn = turnMoment / (1.0 + 5.0 * speed);
+			attackDirectionEstimate = normalizeAngle(
+					attackDirectionEstimate - actualTurn);
+		}
 		return true;
 	}
 
@@ -1214,6 +1252,17 @@ private:
 		if (state.hasAttackGoal) {
 			state.attackGoalDirection = normalizeAngle(
 					state.attackGoalDirection + gBodyState.headAngle);
+		}
+		if (state.hasAttackGoal) {
+			hasAttackDirectionEstimate = true;
+			attackDirectionEstimate = state.attackGoalDirection;
+			attackDirectionLandmarkCycle = state.cycle;
+		}
+		else if (state.hasOwnGoal) {
+			hasAttackDirectionEstimate = true;
+			attackDirectionEstimate = normalizeAngle(
+					state.ownGoalDirection + 180.0);
+			attackDirectionLandmarkCycle = state.cycle;
 		}
 
 		collectPlayersFromSee(msg, "(player ", state);
@@ -1814,7 +1863,7 @@ private:
 		return isForwardPlayer()
 				&& lastPassTargetUnum == iPlayerId
 				&& cycle - lastPassCycle >= 0
-				&& cycle - lastPassCycle <= 20;
+				&& cycle - lastPassCycle <= 14;
 	}
 
 	void appendReceptionTouchSignal(int cycle, char *command,
@@ -1863,17 +1912,18 @@ private:
 		const int supportPower = staminaDashPower(
 				farFromBall ? 76 : 82, false);
 		double laneBase = visual.ballDirection;
-		if (visual.hasAttackGoal) {
-			laneBase = visual.attackGoalDirection;
-		}
-		else if (visual.hasOwnGoal) {
-			laneBase = normalizeAngle(visual.ownGoalDirection + 180.0);
-		}
+		getAttackDirection(visual, laneBase);
 		double supportOffset = iPlayerId == 5
 				? (farFromBall ? 34.0 : 26.0)
 				: (farFromBall ? -34.0 : -26.0);
 		SeenPlayer partner;
 		const int partnerUnum = iPlayerId == 4 ? 5 : 4;
+		const bool partnerOwnsChase = lastHeardChaseUnum == partnerUnum
+				&& visual.cycle - lastHeardChaseCycle >= 0
+				&& visual.cycle - lastHeardChaseCycle <= 4;
+		if (partnerOwnsChase) {
+			supportOffset = iPlayerId == 5 ? 42.0 : -42.0;
+		}
 		if (findTeammate(visual, partnerUnum, partner)) {
 			const double partnerSide = normalizeAngle(
 					partner.direction - laneBase);
@@ -1968,12 +2018,7 @@ private:
 		if (underPressure && (!visual.hasAttackGoal
 				|| visual.attackGoalDistance > 20.0)) {
 			double escapeBase = 0.0;
-			if (visual.hasAttackGoal) {
-				escapeBase = visual.attackGoalDirection;
-			}
-			else if (visual.hasOwnGoal) {
-				escapeBase = normalizeAngle(visual.ownGoalDirection + 180.0);
-			}
+			getAttackDirection(visual, escapeBase);
 			const double escapeDirection = chooseOpenAdvanceDirection(
 					visual, escapeBase, iPlayerId);
 			sprintf(command, "(kick 82 %.1f)", escapeDirection);
@@ -2025,12 +2070,7 @@ private:
 		}
 
 		double baseDirection = 0.0;
-		if (visual.hasAttackGoal) {
-			baseDirection = visual.attackGoalDirection;
-		}
-		else if (visual.hasOwnGoal) {
-			baseDirection = normalizeAngle(visual.ownGoalDirection + 180.0);
-		}
+		getAttackDirection(visual, baseDirection);
 		const double advanceDirection = chooseOpenAdvanceDirection(
 				visual, baseDirection, iPlayerId);
 		int touchPower = visual.hasAttackGoal
@@ -2404,16 +2444,31 @@ private:
 
 		const int passTarget = isFreshPassTarget(cycle);
 		if (!visual.hasBall) {
-			if (passTarget) {
+			const int passAge = cycle - lastPassCycle;
+			const bool arrivingInBlindCycle = passTarget
+					&& cycle - lastSeenBallCycle == 1
+					&& lastSeenBallDistance <= 1.3
+					&& gBallTrack.hasMotion
+					&& gBallTrack.closingRate > 0.15;
+			if (arrivingInBlindCycle) {
+				double trapDirection = 0.0;
+				getAttackDirection(visual, trapDirection);
+				sprintf(command, "(kick 45 %.1f)", trapDirection);
+				markOwnTouch(cycle, 5);
+				gLastAttackAction = "receive_trap";
+				logAttackDecision(cycle, visual,
+						gLastAttackAction, command);
+			}
+			else if (passTarget && passAge <= 5) {
 				if (absDouble(lastPassSourceDirection) > 10.0) {
 					sprintf(command, "(turn %.1f)",
 							lastPassSourceDirection);
-					lastPassSourceDirection = 0.0;
+					lastPassSourceDirection *= 0.45;
 					gLastAttackAction = "receive_scan";
 				}
 				else {
-					sprintf(command, "(dash 85)");
-					gLastAttackAction = "receive_meet";
+					sprintf(command, "(turn 0)");
+					gLastAttackAction = "receive_track";
 				}
 				logAttackDecision(cycle, visual,
 						gLastAttackAction, command);
@@ -2475,7 +2530,7 @@ private:
 			return;
 		}
 
-		if (ballDistance > 1.05) {
+		if (ballDistance > 1.10) {
 			const double chaseDir = predictedBallDirection(visual, 3);
 			if (absDouble(chaseDir) > 18.0) {
 				sprintf(command, "(turn %.1f)", chaseDir);
@@ -2485,7 +2540,13 @@ private:
 			else {
 				int dashPower = 100;
 				if (ballDistance < 1.8) {
-					dashPower = passTarget ? 90 : 82;
+					const bool ballApproaching = gBallTrack.hasMotion
+							&& gBallTrack.closingRate > 0.15;
+					dashPower = ballApproaching
+							? 35 : (passTarget ? 76 : 70);
+				}
+				else if (ballDistance < 2.5) {
+					dashPower = passTarget ? 88 : 80;
 				}
 				dashPower = staminaDashPower(dashPower, true);
 				if (cycle - lastChaseSayCycle >= 5) {
