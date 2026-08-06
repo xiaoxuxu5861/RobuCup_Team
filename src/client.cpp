@@ -1736,7 +1736,7 @@ private:
 				appendBallNeckCommand(visual, command, sizeof(command));
 				markOwnTouch(cycle, 0);
 				kickoffTouchCycle = cycle;
-				kickoffSecondTouchLockUntilCycle = cycle + 45;
+				kickoffSecondTouchLockUntilCycle = cycle + 24;
 				gLastAttackAction = "kickoff_touch";
 			}
 		}
@@ -2303,6 +2303,36 @@ private:
 				farFromBall ? 100 : 90, false);
 		double bodyDirection = 0.0;
 		if (selfPositionIsFresh(visual.cycle)
+				&& gGlobalBallTrack.hasSample
+				&& gGlobalBallTrack.cycle == visual.cycle
+				&& getBodyGlobalDirection(bodyDirection)) {
+			const double attackSign = activeSide() == 1 ? 1.0 : -1.0;
+			const double selfProgress = selfPositionX * attackSign;
+			const double ballProgress = gGlobalBallTrack.x * attackSign;
+			const double desiredLead = farFromBall ? 10.0 : 12.0;
+			const double targetProgress = clampDouble(
+					ballProgress + desiredLead, -15.0, 24.0);
+			if (selfProgress > targetProgress + 3.0) {
+				const double radians = 3.141592653589793 / 180.0;
+				const double targetX = targetProgress * attackSign;
+				const double laneOffset = iPlayerId == 4 ? -8.0 : 8.0;
+				const double targetY = clampDouble(
+						gGlobalBallTrack.y + laneOffset, -18.0, 18.0);
+				const double globalDirection = std::atan2(
+						targetY - selfPositionY,
+						targetX - selfPositionX) / radians;
+				const double reconnectDirection = normalizeAngle(
+						globalDirection - bodyDirection);
+				gLastAttackAction = "support_reconnect";
+				makeTurnOrDashCommand(reconnectDirection,
+						staminaDashPower(85, false), command, 24.0);
+				if (std::strncmp(command, "(dash", 5) == 0) {
+					appendBallNeckCommand(visual, command, 160);
+				}
+				return;
+			}
+		}
+		if (selfPositionIsFresh(visual.cycle)
 				&& absDouble(selfPositionY) > 18.0
 				&& getBodyGlobalDirection(bodyDirection)) {
 			const double radians = 3.141592653589793 / 180.0;
@@ -2358,6 +2388,26 @@ private:
 
 	void makeKickoffTakerSupportCommand(const VisualState &visual,
 			char *command) {
+		const int supportAge = visual.cycle - kickoffTouchCycle;
+		if (supportAge > 12) {
+			if (visual.hasBall) {
+				gLastAttackAction = "kickoff_support_track";
+				if (absDouble(visual.ballDirection) > 12.0) {
+					sprintf(command, "(turn %.1f)", visual.ballDirection);
+				}
+				else {
+					sprintf(command, "(turn 0)");
+				}
+				appendBallNeckCommand(visual, command, 160);
+			}
+			else {
+				gLastAttackAction = "kickoff_support_scan";
+				sprintf(command, "(turn 45)");
+				appendCenterNeckCommand(command, 160);
+			}
+			return;
+		}
+
 		double forwardDirection = 0.0;
 		if (!getAttackDirection(visual, forwardDirection)) {
 			sprintf(command, "(turn 20)");
@@ -2408,13 +2458,34 @@ private:
 					&& cycle - lastOwnKickOffCycle <= 70;
 			if (kickoffRelay) {
 				double relayDirection = 0.0;
-				getAttackDirection(visual, relayDirection);
-				relayDirection = chooseOpenAdvanceDirection(
-						visual, relayDirection, iPlayerId);
-				int relayPower = 55
-						+ static_cast<int>((cycle - lastPassCycle) * 1.5);
-				if (relayPower < 65) relayPower = 65;
-				if (relayPower > 100) relayPower = 100;
+				int relayPower = 0;
+				if (hasPartner && partner.distance >= 3.0
+						&& partner.distance <= 28.0) {
+					relayDirection = partner.direction;
+					double relayDistance = partner.distance + 2.0;
+					if (visual.hasAttackGoal) {
+						const double leadAngle = clampDouble(normalizeAngle(
+								visual.attackGoalDirection
+								- partner.direction) * 0.18,
+								-8.0, 8.0);
+						relayDirection = normalizeAngle(
+								partner.direction + leadAngle);
+					}
+					relayPower = kickPowerForDistance(relayDistance);
+					if (relayPower < 72) relayPower = 72;
+					if (relayPower > 88) relayPower = 88;
+					gLastAttackAction = "kickoff_relay_targeted";
+				}
+				else {
+					getAttackDirection(visual, relayDirection);
+					relayDirection = chooseOpenAdvanceDirection(
+							visual, relayDirection, iPlayerId);
+					relayPower = 52
+							+ static_cast<int>(cycle - lastPassCycle);
+					if (relayPower < 70) relayPower = 70;
+					if (relayPower > 82) relayPower = 82;
+					gLastAttackAction = "kickoff_relay_blind";
+				}
 				sprintf(command, "(kick %d %.1f)(say \"p4\")",
 						relayPower,
 						relayDirection);
@@ -2422,7 +2493,6 @@ private:
 				markOwnTouch(cycle, 0);
 				lastPassTargetUnum = 4;
 				lastPassCycle = cycle;
-				gLastAttackAction = "kickoff_relay";
 				return;
 			}
 
@@ -2447,7 +2517,9 @@ private:
 					passPower,
 					passDirection, partnerUnum);
 			appendBallNeckCommand(visual, command, 160);
-			markOwnTouch(cycle, 1);
+			markOwnTouch(cycle, 0);
+			lastPassTargetUnum = partnerUnum;
+			lastPassCycle = cycle;
 			return;
 		}
 
@@ -2520,7 +2592,7 @@ private:
 		const bool clearBreakaway = !underPressure
 				&& !hasNearbyOpponent(visual, 9.0)
 				&& !hasOpponentInLane(visual, advanceDirection, 12.0, 16.0);
-		int touchPower = clearBreakaway ? 55 : 42;
+		int touchPower = clearBreakaway ? 46 : 42;
 		if (underPressure) {
 			touchPower = 78;
 			gLastAttackAction = "escape_touch";
@@ -2534,7 +2606,7 @@ private:
 		sprintf(command, "(kick %d %.1f)", touchPower, advanceDirection);
 		appendReceptionTouchSignal(cycle, command, 160);
 		appendBallNeckCommand(visual, command, 160);
-		const int followCycles = clearBreakaway ? 12 : 10;
+		const int followCycles = clearBreakaway ? 14 : 10;
 		markOwnTouch(cycle, followCycles);
 	}
 
@@ -2903,7 +2975,7 @@ private:
 			if (blindOwnTouchFollow) {
 				double followDirection = 0.0;
 				getAttackDirection(visual, followDirection);
-				if (absDouble(followDirection) > 28.0) {
+				if (absDouble(followDirection) > 12.0) {
 					sprintf(command, "(turn %.1f)", followDirection);
 					gLastAttackAction = "follow_touch_blind_turn";
 				}
@@ -2996,6 +3068,14 @@ private:
 			activeChase = 1;
 			effectiveChaseLimit = 30.0;
 			gLastAttackAction = "receive";
+		}
+		const int outgoingPassAge = cycle - lastPassCycle;
+		const bool yieldingToReceiver = isForwardPlayer()
+				&& lastPassTargetUnum != 0
+				&& lastPassTargetUnum != iPlayerId
+				&& outgoingPassAge >= 1 && outgoingPassAge <= 7;
+		if (yieldingToReceiver) {
+			activeChase = 0;
 		}
 
 		if (!activeChase || ballDistance > effectiveChaseLimit) {
