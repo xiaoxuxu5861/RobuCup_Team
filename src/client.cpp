@@ -224,6 +224,7 @@ double lastSeenBallDirection = 0.0;
 int lastOwnKickOffCycle = -100;
 int kickoffTouchCycle = -100;
 int kickoffSecondTouchLockUntilCycle = -100;
+int lastBreakawayAlignCycle = -100;
 int lastTackleCycle = -100;
 int lastDefenderKickCycle = -100;
 int lastSetPieceKickCycle = -100;
@@ -278,6 +279,7 @@ void clearTransientAttackState() {
 	lastOwnKickOffCycle = -100;
 	kickoffTouchCycle = -100;
 	kickoffSecondTouchLockUntilCycle = -100;
+	lastBreakawayAlignCycle = -100;
 	lastTackleCycle = -100;
 	lastDefenderKickCycle = -100;
 	lastSetPieceKickCycle = -100;
@@ -2592,6 +2594,17 @@ private:
 		const bool clearBreakaway = !underPressure
 				&& !hasNearbyOpponent(visual, 9.0)
 				&& !hasOpponentInLane(visual, advanceDirection, 12.0, 16.0);
+		const bool ballSettledForAlignment = !gBallTrack.hasMotion
+				|| absDouble(gBallTrack.closingRate) < 0.12;
+		if (clearBreakaway && ballSettledForAlignment
+				&& cycle - lastBreakawayAlignCycle >= 20
+				&& absDouble(advanceDirection) > 60.0) {
+			sprintf(command, "(turn %.1f)", advanceDirection);
+			appendBallNeckCommand(visual, command, 160);
+			lastBreakawayAlignCycle = cycle;
+			gLastAttackAction = "breakaway_align";
+			return;
+		}
 		int touchPower = clearBreakaway ? 46 : 42;
 		if (underPressure) {
 			touchPower = 78;
@@ -3085,9 +3098,25 @@ private:
 			return;
 		}
 
+		if (ballDistance <= 2.6
+				&& absDouble(visual.ballDirection) <= 45.0
+				&& hasNearbyOpponent(visual, 3.0)
+				&& cycle - lastTackleCycle >= 10) {
+			sprintf(command, "(tackle 100)");
+			lastTackleCycle = cycle;
+			gLastAttackAction = "forward_tackle";
+			appendBallNeckCommand(visual, command, sizeof(command));
+			logAttackDecision(cycle, visual, gLastAttackAction, command);
+			sendCmd(command);
+			return;
+		}
+
 		if (ballDistance > 1.10) {
 			const double chaseDir = predictedBallDirection(visual, 3);
-			if (absDouble(chaseDir) > 30.0) {
+			const bool contestedSideDash = ballDistance <= 2.8
+					&& absDouble(chaseDir) <= 55.0
+					&& hasNearbyOpponent(visual, 4.0);
+			if (absDouble(chaseDir) > 30.0 && !contestedSideDash) {
 				sprintf(command, "(turn %.1f)", chaseDir);
 				gLastAttackAction = passTarget
 						? "receive_turn" : "chase_turn";
@@ -3104,16 +3133,25 @@ private:
 					dashPower = passTarget ? 88 : 80;
 				}
 				dashPower = staminaDashPower(dashPower, true);
+				const double dashDirection = contestedSideDash
+						? clampDouble(chaseDir, -45.0, 45.0) : 0.0;
 				if (cycle - lastChaseSayCycle >= 5) {
-					sprintf(command, "(dash %d 0)(say \"c%d\")",
-							dashPower, iPlayerId);
+					sprintf(command, "(dash %d %.1f)(say \"c%d\")",
+							dashPower, dashDirection, iPlayerId);
 					lastChaseSayCycle = cycle;
 				}
 				else {
-					sprintf(command, "(dash %d 0)", dashPower);
+					sprintf(command, "(dash %d %.1f)",
+							dashPower, dashDirection);
 				}
-				gLastAttackAction = passTarget
-						? "receive_dash" : "chase_dash";
+				if (contestedSideDash) {
+					gLastAttackAction = passTarget
+							? "receive_side_dash" : "chase_side_dash";
+				}
+				else {
+					gLastAttackAction = passTarget
+							? "receive_dash" : "chase_dash";
+				}
 				appendBallNeckCommand(visual, command, sizeof(command));
 			}
 			logAttackDecision(cycle, visual, gLastAttackAction, command);
