@@ -118,6 +118,13 @@ struct SeenPlayer {
 	double direction;
 };
 
+struct SeenLandmark {
+	double x;
+	double y;
+	double distance;
+	double direction;
+};
+
 struct VisualState {
 	int cycle;
 	bool hasBall;
@@ -133,6 +140,8 @@ struct VisualState {
 	double ownGoalDirection;
 	double attackGoalDistance;
 	double attackGoalDirection;
+	SeenLandmark landmarks[16];
+	int landmarkCount;
 	SeenPlayer teammates[4];
 	int teammateCount;
 	SeenPlayer opponents[5];
@@ -1120,8 +1129,8 @@ const char * ownGoalShortName() {
 void formationPosition(int playerId, double &x, double &y) {
 	// 开球落位一律使用左队坐标系。
 	// 右队的 (move) 由服务器自动镜像，客户端不可再取反。
-	static const double formationX[6] = { 0.0, -48.0, -36.0, -36.0, -8.0, -8.0 };
-	static const double formationY[6] = { 0.0, 0.0, -10.0, 10.0, -7.0, 7.0 };
+	static const double formationX[6] = { 0.0, -48.0, -40.0, -40.0, -8.0, -8.0 };
+	static const double formationY[6] = { 0.0, 0.0, -7.5, 7.5, -7.0, 7.0 };
 
 	if (playerId < 1 || playerId > 5) playerId = 5;
 	x = formationX[playerId];
@@ -1253,12 +1262,7 @@ private:
 		sprintf(command, "(move %.1f %.1f)", startX, startY);
 		if (!sendCmd(command)) return;
 
-		if (iPlayerId == 1) {
-			sprintf(command, "(change_view normal high)");
-		}
-		else {
-			sprintf(command, "(change_view narrow high)");
-		}
+		sprintf(command, "(change_view narrow high)");
 		if (!sendCmd(command)) return;
 
 		sprintf(command, "(synch_see)");
@@ -1393,6 +1397,144 @@ private:
 				|| readObjectInfo(msg, ownGoalShortName(), distance, direction);
 	}
 
+	void collectLandmarksFromSee(const char *msg, VisualState &state) {
+		struct LandmarkDefinition {
+			const char *name;
+			double x;
+			double y;
+		};
+		static const LandmarkDefinition definitions[] = {
+			{ "(f c)", 0.0, 0.0 },
+			{ "(f c t)", 0.0, -34.0 },
+			{ "(f c b)", 0.0, 34.0 },
+			{ "(f l t)", -52.5, -34.0 },
+			{ "(f l b)", -52.5, 34.0 },
+			{ "(f r t)", 52.5, -34.0 },
+			{ "(f r b)", 52.5, 34.0 },
+			{ "(f g l t)", -52.5, -7.01 },
+			{ "(f g l b)", -52.5, 7.01 },
+			{ "(f g r t)", 52.5, -7.01 },
+			{ "(f g r b)", 52.5, 7.01 },
+			{ "(f p l c)", -36.0, 0.0 },
+			{ "(f p l t)", -36.0, -20.15 },
+			{ "(f p l b)", -36.0, 20.15 },
+			{ "(f p r c)", 36.0, 0.0 },
+			{ "(f p r t)", 36.0, -20.15 },
+			{ "(f p r b)", 36.0, 20.15 }
+		};
+		const size_t definitionCount = sizeof(definitions)
+				/ sizeof(definitions[0]);
+		for (size_t i = 0; i < definitionCount
+				&& state.landmarkCount < 16; ++i) {
+			double distance = 0.0;
+			double direction = 0.0;
+			if (!readObjectInfo(msg, definitions[i].name,
+						distance, direction)) {
+				continue;
+			}
+			SeenLandmark &landmark = state.landmarks[state.landmarkCount++];
+			landmark.x = definitions[i].x;
+			landmark.y = definitions[i].y;
+			landmark.distance = distance;
+			landmark.direction = normalizeAngle(
+					direction + gBodyState.headAngle);
+		}
+	}
+
+	bool localizeGoalkeeperFromLandmarks(const VisualState &state) {
+		if (iPlayerId != 1 || state.landmarkCount < 2) {
+			return false;
+		}
+
+		const double radians = 3.141592653589793 / 180.0;
+		int bestFirst = -1;
+		int bestSecond = -1;
+		double bestScore = -1.0;
+		double bodyDirection = 0.0;
+		for (int i = 0; i < state.landmarkCount; ++i) {
+			const SeenLandmark &first = state.landmarks[i];
+			const double firstAngle = first.direction * radians;
+			const double firstLocalX = first.distance * std::cos(firstAngle);
+			const double firstLocalY = first.distance * std::sin(firstAngle);
+			for (int j = i + 1; j < state.landmarkCount; ++j) {
+				const SeenLandmark &second = state.landmarks[j];
+				const double secondAngle = second.direction * radians;
+				const double localX = second.distance * std::cos(secondAngle)
+						- firstLocalX;
+				const double localY = second.distance * std::sin(secondAngle)
+						- firstLocalY;
+				const double globalX = second.x - first.x;
+				const double globalY = second.y - first.y;
+				const double localLength = std::sqrt(
+						localX * localX + localY * localY);
+				const double globalLength = std::sqrt(
+						globalX * globalX + globalY * globalY);
+				if (globalLength < 12.0
+						|| absDouble(localLength - globalLength)
+								> 4.0 + globalLength * 0.04) {
+					continue;
+				}
+				const double angleSeparation = absDouble(normalizeAngle(
+						second.direction - first.direction));
+				const double score = globalLength
+						+ (angleSeparation > 20.0 ? 20.0 : angleSeparation);
+				if (score > bestScore) {
+					bestScore = score;
+					bestFirst = i;
+					bestSecond = j;
+					bodyDirection = normalizeAngle((std::atan2(
+							globalY, globalX) - std::atan2(localY, localX))
+							/ radians);
+				}
+			}
+		}
+		if (bestFirst < 0 || bestSecond < 0) {
+			return false;
+		}
+
+		const double bodyRadians = bodyDirection * radians;
+		const double cosine = std::cos(bodyRadians);
+		const double sine = std::sin(bodyRadians);
+		double positionX = 0.0;
+		double positionY = 0.0;
+		int usedLandmarks = 0;
+		for (int i = 0; i < state.landmarkCount; ++i) {
+			const SeenLandmark &landmark = state.landmarks[i];
+			const double localAngle = landmark.direction * radians;
+			const double localX = landmark.distance * std::cos(localAngle);
+			const double localY = landmark.distance * std::sin(localAngle);
+			const double estimateX = landmark.x
+					- (cosine * localX - sine * localY);
+			const double estimateY = landmark.y
+					- (sine * localX + cosine * localY);
+			if (estimateX < -60.0 || estimateX > 60.0
+					|| estimateY < -40.0 || estimateY > 40.0) {
+				continue;
+			}
+			positionX += estimateX;
+			positionY += estimateY;
+			++usedLandmarks;
+		}
+		if (usedLandmarks < 2) {
+			return false;
+		}
+
+		selfPositionX = positionX / usedLandmarks;
+		selfPositionY = positionY / usedLandmarks;
+		selfPositionCycle = state.cycle;
+		selfPositionLandmarkCycle = state.cycle;
+		hasSelfPositionEstimate = true;
+		hasAttackDirectionEstimate = true;
+		attackDirectionEstimate = normalizeAngle(
+				attackGlobalDirection() - bodyDirection);
+		attackDirectionLandmarkCycle = state.cycle;
+		printf("goalie_localization: cycle=%d flags=%d pair=%d/%d "
+				"position=(%.2f %.2f) body=%.1f\n",
+				state.cycle, usedLandmarks, bestFirst, bestSecond,
+				selfPositionX, selfPositionY, bodyDirection);
+		return true;
+	}
+
 	void collectPlayersFromSee(const char *msg, const char *tag,
 			VisualState &state) {
 		const size_t tagLen = std::strlen(tag);
@@ -1501,7 +1643,10 @@ private:
 					state.ownGoalDirection + 180.0);
 			attackDirectionLandmarkCycle = state.cycle;
 		}
-		calibrateSelfPosition(state);
+		collectLandmarksFromSee(msg, state);
+		if (!localizeGoalkeeperFromLandmarks(state)) {
+			calibrateSelfPosition(state);
+		}
 		updateGlobalBallTrack(state);
 
 		collectPlayersFromSee(msg, "(player ", state);
@@ -1864,9 +2009,9 @@ private:
 				&& gGlobalBallTrack.hasVelocity
 				&& gGlobalBallTrack.cycle == visual.cycle
 				&& (gGlobalBallTrack.incomingStreak >= 2
-						|| (gGlobalBallTrack.speed >= 1.0
+						|| (gGlobalBallTrack.speed >= 1.3
 								&& ballToGoal <= 12.0))
-				&& gGlobalBallTrack.speed >= 0.35
+				&& gGlobalBallTrack.speed >= 0.9
 				&& ballToGoal <= 28.0;
 		const bool recentIncomingPrediction = globalPoseReady
 				&& !currentIncomingPrediction
@@ -2078,7 +2223,11 @@ private:
 				&& gBallTrack.closingStreak >= 2
 				&& gBallTrack.closingRate > 0.15
 				&& visual.ballDistance <= 18.0;
-		const double catchReach = fastApproachingShot ? 1.20 : 1.15;
+		double catchReach = 1.15;
+		if (fastApproachingShot) {
+			catchReach = 1.20 + clampDouble(
+					gBallTrack.closingRate, 0.0, 1.50);
+		}
 		if (goalieState == GS_CATCHING
 				&& cycle > goalieCatchAttemptCycle && visual.hasBall) {
 			goalieState = GS_CHASING;
@@ -2107,10 +2256,29 @@ private:
 
 		if (visual.hasBall && visual.ballDistance <= 2.5
 				&& hasNearbyOpponent(visual, 3.0)
-				&& cycle - lastTackleCycle >= 10) {
-			sprintf(command, "(tackle 100)");
-			lastTackleCycle = cycle;
+				&& !fastApproachingShot) {
+			sprintf(command, "(dash %d %.1f)",
+					staminaDashPower(100, true),
+					predictedBallDirection(visual, 1));
 			appendBallNeckCommand(visual, command, sizeof(command));
+			goalieState = GS_CHASING;
+			sendCmd(command);
+			return;
+		}
+
+		const double desiredBallHead = visual.hasBall
+				? visual.ballDirection : 0.0;
+		if (fastApproachingShot && visual.ballDistance <= 8.0
+				&& absDouble(desiredBallHead) > 85.0
+				&& absDouble(visual.ballNeckDirection) > 5.0) {
+			double bodyTurn = visual.ballNeckDirection;
+			if (gBallTrack.hasMotion) {
+				bodyTurn += gBallTrack.directionRate;
+			}
+			bodyTurn = clampDouble(bodyTurn, -30.0, 30.0);
+			sprintf(command, "(turn %.1f)(turn_neck %.1f)",
+					bodyTurn, -bodyTurn);
+			goalieState = GS_ALIGNING;
 			sendCmd(command);
 			return;
 		}
@@ -2119,7 +2287,12 @@ private:
 		const double forwardDepth = activeSide() == 1
 				? selfPositionX - ownGoalGlobalX()
 				: ownGoalGlobalX() - selfPositionX;
-		if (selfPositionIsFresh(cycle) && absDouble(selfPositionY) > 5.0
+		const bool recoverBlindLateralPosition = !visual.hasBall
+				&& cycle - goalieIncomingThreatCycle > 6
+				&& absDouble(selfPositionY) > 1.5;
+		if (selfPositionIsFresh(cycle)
+				&& (absDouble(selfPositionY) > 5.0
+						|| recoverBlindLateralPosition)
 				&& getBodyGlobalDirection(goalieBodyDirection)) {
 			const double recoveryGlobalDirection = selfPositionY > 0.0
 					? -90.0 : 90.0;
@@ -2192,8 +2365,23 @@ private:
 				else {
 					sprintf(command, "(turn 0)");
 				}
+				double continueDirection = goalieLastBallDirection;
+				if (gBallTrack.hasMotion) {
+					continueDirection += gBallTrack.directionRate * unseenCycles;
+				}
+				continueDirection = clampDouble(
+						continueDirection, -90.0, 90.0);
+				const double neckMoment = clampDouble(
+						continueDirection - gBodyState.headAngle,
+						-180.0, 180.0);
+				char neckCommand[48];
+				sprintf(neckCommand, "(turn_neck %.1f)", neckMoment);
+				if (std::strlen(command) + std::strlen(neckCommand) + 1
+						< sizeof(command)) {
+					std::strcat(command, neckCommand);
+				}
 			}
-			else if (unseenCycles >= 1 && unseenCycles <= 3
+			else if (unseenCycles >= 1 && unseenCycles <= 5
 					&& (goalieState == GS_CHASING
 							|| goalieState == GS_CATCHING)) {
 				double continueDirection = goalieLastBallDirection;
@@ -2207,20 +2395,24 @@ private:
 						-180.0, 180.0);
 				sprintf(command, "(turn 0)(turn_neck %.1f)", neckMoment);
 			}
-			else if (goalieState == GS_RETURNING || goalieAdvanceSteps > 0) {
+			else if (selfPositionIsFresh(cycle)
+					&& hasAttackDirectionEstimate
+					&& unseenCycles > 2
+					&& cycle - goalieIncomingThreatCycle > 6
+					&& absDouble(attackDirectionEstimate) > 20.0) {
+				const double correction = clampDouble(
+						attackDirectionEstimate, -45.0, 45.0);
+				sprintf(command, "(turn %.1f)", correction);
+				appendCenterNeckCommand(command, sizeof(command));
+			}
+			else if ((goalieState == GS_RETURNING || goalieAdvanceSteps > 0)
+					&& !selfPositionIsFresh(cycle)) {
 				goalieState = GS_RETURNING;
 				makeGoalkeeperReturnCommand(visual, command);
 			}
 			else {
-				if (unseenCycles > 5 && hasAttackDirectionEstimate
-						&& absDouble(attackDirectionEstimate) > 45.0) {
-					const double correction = clampDouble(
-							attackDirectionEstimate, -30.0, 30.0);
-					sprintf(command, "(turn %.1f)", correction);
-					appendCenterNeckCommand(command, sizeof(command));
-					sendCmd(command);
-					return;
-				}
+				goalieAdvanceSteps = 0;
+				goalieState = GS_HOLDING;
 				double scanTarget = 0.0;
 				if (unseenCycles >= 1 && unseenCycles <= 5) {
 					scanTarget = goalieLastBallDirection;
@@ -2969,8 +3161,8 @@ private:
 		const bool lastLineEmergency = iPlayerId == 3
 				&& visual.ballDistance <= 16.0
 				&& (!visual.hasOwnGoal || ballToOwnGoal <= 24.0);
-		const double challengeLimit = iPlayerId == 2 ? 30.0 : 18.0;
-		const double defensiveZoneLimit = iPlayerId == 2 ? 48.0 : 34.0;
+		const double challengeLimit = iPlayerId == 2 ? 30.0 : 24.0;
+		const double defensiveZoneLimit = iPlayerId == 2 ? 48.0 : 42.0;
 		const bool ballInDefensiveZone = visual.hasOwnGoal
 				? ballToOwnGoal <= defensiveZoneLimit
 				: visual.ballDistance <= (iPlayerId == 2 ? 20.0 : 14.0);
