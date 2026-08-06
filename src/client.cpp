@@ -1982,7 +1982,7 @@ private:
 			return false;
 		}
 
-		const double guardDepth = 2.5;
+		const double guardDepth = 1.8;
 		double targetX = goalX + lineX * guardDepth / ballToGoal;
 		double targetY = goalY + lineY * guardDepth / ballToGoal;
 		bool protectGoalLine = false;
@@ -2226,7 +2226,7 @@ private:
 		double catchReach = 1.15;
 		if (fastApproachingShot) {
 			catchReach = 1.20 + clampDouble(
-					gBallTrack.closingRate, 0.0, 1.50);
+					gBallTrack.closingRate * 0.25, 0.0, 0.35);
 		}
 		if (goalieState == GS_CATCHING
 				&& cycle > goalieCatchAttemptCycle && visual.hasBall) {
@@ -2328,6 +2328,8 @@ private:
 					- (gBallTrack.hasMotion
 							? gBallTrack.closingRate * unseenCycles : 0.0);
 			if (unseenCycles >= 1 && unseenCycles <= 2
+					&& goalieState != GS_CATCHING
+					&& goalieLastBallDistance <= 1.55
 					&& predictedBlindDistance <= 1.20
 					&& goalieAdvanceSteps <= 3 && blindCatchReady) {
 				sprintf(command, "(catch %.1f)", goalieLastBallDirection);
